@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 AI Research Agent — persistent daemon that crawls, judges, and narrates
-bleeding-edge AI research into daily 3-hour audio digests.
+bleeding-edge AI research into daily audio digests.
 
 Architecture:
-  [Crawlers] --async--> [Queue] --serial--> [M3 Judge] --> [Script Writer] --> [TTS]
+  [Crawlers] --async--> [Queue] --serial--> [LLM Judge] --> [Script Writer] --> [TTS]
 
   Crawlers run concurrently across domains with human-paced delays.
-  M3 stays saturated — always has the next item ready from the queue.
+  The LLM stays saturated — always has the next item ready from the queue.
   Once enough content is judged, the script writer composes a narration
   and TTS synthesizes the MP3.
 
@@ -82,7 +82,7 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
     log.info(f"=== Cycle start === (seen: {len(seen)} URLs)")
 
     if crawl:
-        # start the M3 judge in the background — it will process items as they arrive
+        # start the judge in the background — it will process items as they arrive
         judge_task = asyncio.create_task(judge_loop(queue, stop_event))
 
         # run all crawlers — they feed the queue concurrently

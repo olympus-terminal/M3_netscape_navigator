@@ -1,4 +1,4 @@
-"""M3 judge — scores and summarizes content from the queue. Stays saturated."""
+"""LLM judge — scores and summarizes content from the queue. Stays saturated."""
 
 import asyncio
 import json
@@ -8,10 +8,11 @@ import aiohttp
 
 from config import (
     FOCUS_AREAS,
-    M3_BASE_URL,
-    M3_MAX_TOKENS,
-    M3_MODEL,
-    M3_TEMPERATURE,
+    LLM_API_KEY,
+    LLM_BASE_URL,
+    LLM_MAX_TOKENS,
+    LLM_MODEL,
+    LLM_TEMPERATURE,
     NOVELTY_THRESHOLD,
     RELEVANCE_THRESHOLD,
     TECHNICAL_DEPTH_THRESHOLD,
@@ -54,30 +55,34 @@ For each piece of content, respond with ONLY a JSON object (no markdown, no expl
 }}"""
 
 
-async def _call_m3(text: str) -> dict | None:
+async def _call_llm(text: str) -> dict | None:
+    headers = {"Content-Type": "application/json"}
+    if LLM_API_KEY and LLM_API_KEY != "none":
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+
     payload = {
-        "model": M3_MODEL,
+        "model": LLM_MODEL,
         "messages": [
             {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
             {"role": "user", "content": text},
         ],
-        "max_tokens": M3_MAX_TOKENS,
-        "temperature": M3_TEMPERATURE,
+        "max_tokens": LLM_MAX_TOKENS,
+        "temperature": LLM_TEMPERATURE,
     }
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"{M3_BASE_URL}/chat/completions",
+                f"{LLM_BASE_URL}/chat/completions",
                 json=payload,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
                 if resp.status != 200:
-                    log.warning(f"M3 returned {resp.status}: {await resp.text()}")
+                    log.warning(f"LLM returned {resp.status}: {await resp.text()}")
                     return None
                 data = await resp.json()
                 content = data["choices"][0]["message"]["content"]
-                # strip markdown fences if present
                 content = content.strip()
                 if content.startswith("```"):
                     content = content.split("\n", 1)[1]
@@ -85,10 +90,10 @@ async def _call_m3(text: str) -> dict | None:
                         content = content[:-3]
                 return json.loads(content.strip())
     except json.JSONDecodeError as e:
-        log.warning(f"M3 returned non-JSON: {e}")
+        log.warning(f"LLM returned non-JSON: {e}")
         return None
     except Exception as e:
-        log.warning(f"M3 call failed: {e}")
+        log.warning(f"LLM call failed: {e}")
         return None
 
 
@@ -104,14 +109,14 @@ def _format_for_judge(item: ContentItem) -> str:
     parts.append(f"TYPE: {item.content_type.value}")
     if item.abstract and item.abstract != item.raw_text:
         parts.append(f"ABSTRACT: {item.abstract}")
-    text = item.raw_text[:6000]  # cap input size
+    text = item.raw_text[:6000]
     parts.append(f"CONTENT:\n{text}")
     return "\n\n".join(parts)
 
 
 async def judge_loop(queue: ContentQueue, stop_event: asyncio.Event):
-    """Pull items from the pending queue and judge them via M3. Runs until stopped."""
-    log.info("M3 judge started — waiting for content")
+    """Pull items from the pending queue and judge them via the LLM. Runs until stopped."""
+    log.info("Judge started — waiting for content")
 
     while not stop_event.is_set():
         try:
@@ -122,9 +127,9 @@ async def judge_loop(queue: ContentQueue, stop_event: asyncio.Event):
         prompt = _format_for_judge(item)
         log.info(f"Judging: {item.title[:80]}")
 
-        result = await _call_m3(prompt)
+        result = await _call_llm(prompt)
         if result is None:
-            log.warning(f"M3 failed to judge: {item.title[:80]}, re-queuing")
+            log.warning(f"LLM failed to judge: {item.title[:80]}, re-queuing")
             await queue.submit(item)
             await asyncio.sleep(10)
             continue
@@ -136,7 +141,6 @@ async def judge_loop(queue: ContentQueue, stop_event: asyncio.Event):
         item.summary = result.get("summary", "")
         item.key_contributions = result.get("key_contributions", "")
 
-        # enforce thresholds even if M3 said "keep"
         if (
             item.technical_depth < TECHNICAL_DEPTH_THRESHOLD
             or item.novelty < NOVELTY_THRESHOLD
@@ -146,4 +150,4 @@ async def judge_loop(queue: ContentQueue, stop_event: asyncio.Event):
 
         await queue.submit_judged(item)
 
-    log.info("M3 judge stopped")
+    log.info("Judge stopped")

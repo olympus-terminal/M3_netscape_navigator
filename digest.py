@@ -13,12 +13,14 @@ import aiohttp
 from config import (
     AUDIO_DIR,
     DIGEST_DIR,
-    M3_BASE_URL,
-    M3_MAX_TOKENS,
-    M3_MODEL,
+    LLM_API_KEY,
+    LLM_BASE_URL,
+    LLM_MAX_TOKENS,
+    LLM_MODEL,
     SCRIPT_DIR_OUT,
     TARGET_WORD_COUNT,
     TTS_CONDA_PYTHON,
+    TTS_ENABLED,
     TTS_FORMAT,
     TTS_SCRIPT,
     TTS_SCRIPT_DIR,
@@ -52,31 +54,36 @@ The script will be read by a text-to-speech system, so:
 - Use periods for pauses, not commas in long sequences"""
 
 
-async def _call_m3_scriptwriter(content: str) -> str | None:
+async def _call_llm_scriptwriter(content: str) -> str | None:
+    headers = {"Content-Type": "application/json"}
+    if LLM_API_KEY and LLM_API_KEY != "none":
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+
     payload = {
-        "model": M3_MODEL,
+        "model": LLM_MODEL,
         "messages": [
             {"role": "system", "content": SCRIPT_WRITER_SYSTEM},
             {"role": "user", "content": content},
         ],
-        "max_tokens": M3_MAX_TOKENS,
+        "max_tokens": LLM_MAX_TOKENS,
         "temperature": 0.5,
     }
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"{M3_BASE_URL}/chat/completions",
+                f"{LLM_BASE_URL}/chat/completions",
                 json=payload,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=300),
             ) as resp:
                 if resp.status != 200:
-                    log.warning(f"M3 scriptwriter returned {resp.status}")
+                    log.warning(f"LLM scriptwriter returned {resp.status}")
                     return None
                 data = await resp.json()
                 return data["choices"][0]["message"]["content"]
     except Exception as e:
-        log.warning(f"M3 scriptwriter call failed: {e}")
+        log.warning(f"LLM scriptwriter call failed: {e}")
         return None
 
 
@@ -110,7 +117,7 @@ def _prepare_batch_prompt(items: list[ContentItem], batch_num: int, total_batche
 
 
 async def compose_digest_script(items: list[ContentItem]) -> Path | None:
-    """Take judged items and produce a narration script via M3."""
+    """Take judged items and produce a narration script via the LLM."""
     if not items:
         log.warning("No items to compose digest from")
         return None
@@ -119,8 +126,7 @@ async def compose_digest_script(items: list[ContentItem]) -> Path | None:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     script_path = SCRIPT_DIR_OUT / f"digest_{stamp}.txt"
 
-    # batch items so we don't exceed M3 context with a single call
-    batch_size = max(5, len(items) // 6)  # ~6 batches for ~3 hours
+    batch_size = max(5, len(items) // 6)
     batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
     total_batches = len(batches)
 
@@ -130,7 +136,7 @@ async def compose_digest_script(items: list[ContentItem]) -> Path | None:
     for i, batch in enumerate(batches, 1):
         log.info(f"Writing segment {i}/{total_batches} ({len(batch)} items)")
         prompt = _prepare_batch_prompt(batch, i, total_batches)
-        segment = await _call_m3_scriptwriter(prompt)
+        segment = await _call_llm_scriptwriter(prompt)
         if segment:
             segments.append(segment)
         else:
@@ -154,6 +160,10 @@ async def compose_digest_script(items: list[ContentItem]) -> Path | None:
 
 def synthesize_audio(script_path: Path) -> Path | None:
     """Run the TTS pipeline on the digest script to produce an MP3."""
+    if not TTS_ENABLED:
+        log.info("TTS not configured — skipping audio synthesis. Script saved as text.")
+        return None
+
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
@@ -169,7 +179,7 @@ def synthesize_audio(script_path: Path) -> Path | None:
         "--screen",
     ]
 
-    log.info(f"Starting TTS synthesis: {' '.join(cmd[:6])}...")
+    log.info(f"Starting TTS synthesis...")
 
     try:
         result = subprocess.run(
@@ -177,7 +187,7 @@ def synthesize_audio(script_path: Path) -> Path | None:
             capture_output=True,
             text=True,
             env=env,
-            timeout=7200,  # 2 hour timeout for long digests
+            timeout=7200,
             cwd=str(AUDIO_DIR),
         )
 
@@ -185,23 +195,22 @@ def synthesize_audio(script_path: Path) -> Path | None:
             log.error(f"TTS failed (exit {result.returncode}):\n{result.stderr[-2000:]}")
             return None
 
-        # find the output mp3
         mp3_files = sorted(AUDIO_DIR.glob("*_complete.mp3"), key=lambda p: p.stat().st_mtime)
         if mp3_files:
             output = mp3_files[-1]
             size_mb = output.stat().st_size / (1024 * 1024)
             log.info(f"TTS complete: {output} ({size_mb:.1f} MB)")
             return output
-        else:
-            # look in subdirectories
-            mp3_files = sorted(AUDIO_DIR.rglob("*_complete.mp3"), key=lambda p: p.stat().st_mtime)
-            if mp3_files:
-                output = mp3_files[-1]
-                size_mb = output.stat().st_size / (1024 * 1024)
-                log.info(f"TTS complete: {output} ({size_mb:.1f} MB)")
-                return output
-            log.error("TTS completed but no output MP3 found")
-            return None
+
+        mp3_files = sorted(AUDIO_DIR.rglob("*_complete.mp3"), key=lambda p: p.stat().st_mtime)
+        if mp3_files:
+            output = mp3_files[-1]
+            size_mb = output.stat().st_size / (1024 * 1024)
+            log.info(f"TTS complete: {output} ({size_mb:.1f} MB)")
+            return output
+
+        log.error("TTS completed but no output MP3 found")
+        return None
 
     except subprocess.TimeoutExpired:
         log.error("TTS synthesis timed out after 2 hours")
