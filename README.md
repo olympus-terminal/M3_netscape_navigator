@@ -1,4 +1,4 @@
-# ai-research-agent
+# M3_netscape_navigator
 
 Autonomous agent that crawls bleeding-edge AI research, filters it through a local LLM, and produces daily audio digests via text-to-speech.
 
@@ -37,8 +37,8 @@ Designed for researchers who want technically dense, PhD-level briefings — not
 ## Setup
 
 ```bash
-git clone https://github.com/olympus-terminal/ai-research-agent.git
-cd ai-research-agent
+git clone https://github.com/olympus-terminal/M3_netscape_navigator.git
+cd M3_netscape_navigator
 pip install -r requirements.txt
 cp .env.example .env
 # Edit .env with your LLM endpoint and optional TTS paths
