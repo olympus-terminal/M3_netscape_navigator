@@ -65,7 +65,7 @@ async def _call_llm_scriptwriter(content: str) -> str | None:
             {"role": "system", "content": SCRIPT_WRITER_SYSTEM},
             {"role": "user", "content": content},
         ],
-        "max_tokens": LLM_MAX_TOKENS,
+        "max_tokens": 131072,
         "temperature": 0.5,
     }
 
@@ -75,7 +75,7 @@ async def _call_llm_scriptwriter(content: str) -> str | None:
                 f"{LLM_BASE_URL}/chat/completions",
                 json=payload,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=300),
+                timeout=aiohttp.ClientTimeout(total=1800),
             ) as resp:
                 if resp.status != 200:
                     log.warning(f"LLM scriptwriter returned {resp.status}")
