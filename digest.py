@@ -195,14 +195,8 @@ def synthesize_audio(script_path: Path) -> Path | None:
             log.error(f"TTS failed (exit {result.returncode}):\n{result.stderr[-2000:]}")
             return None
 
-        mp3_files = sorted(AUDIO_DIR.glob("*_complete.mp3"), key=lambda p: p.stat().st_mtime)
-        if mp3_files:
-            output = mp3_files[-1]
-            size_mb = output.stat().st_size / (1024 * 1024)
-            log.info(f"TTS complete: {output} ({size_mb:.1f} MB)")
-            return output
-
-        mp3_files = sorted(AUDIO_DIR.rglob("*_complete.mp3"), key=lambda p: p.stat().st_mtime)
+        # TTS pipeline may output to various locations and naming patterns
+        mp3_files = sorted(AUDIO_DIR.rglob("*.mp3"), key=lambda p: p.stat().st_mtime)
         if mp3_files:
             output = mp3_files[-1]
             size_mb = output.stat().st_size / (1024 * 1024)

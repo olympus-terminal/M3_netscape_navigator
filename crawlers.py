@@ -20,6 +20,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate",
 }
 
 
@@ -33,15 +34,23 @@ async def _delay_for_domain(domain: str):
 async def _fetch(session: aiohttp.ClientSession, url: str, as_text: bool = True) -> Optional[str]:
     domain = urlparse(url).netloc
     await _delay_for_domain(domain)
-    try:
-        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-            if resp.status != 200:
-                log.warning(f"HTTP {resp.status} for {url}")
-                return None
-            return await resp.text() if as_text else await resp.read()
-    except Exception as e:
-        log.warning(f"Fetch error for {url}: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status == 429:
+                    wait = 60 * (attempt + 1)
+                    log.warning(f"Rate limited (429) by {domain}, backing off {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status != 200:
+                    log.warning(f"HTTP {resp.status} for {url}")
+                    return None
+                return await resp.text() if as_text else await resp.read()
+        except Exception as e:
+            log.warning(f"Fetch error for {url}: {e}")
+            return None
+    log.warning(f"Gave up after 3 rate-limit retries for {url}")
+    return None
 
 
 def _strip_html(html: str) -> str:
@@ -174,7 +183,7 @@ async def crawl_github_trending(queue: ContentQueue, seen: set, session: aiohttp
         if not html:
             continue
 
-        for match in re.finditer(r'<h2 class="h3 lh-condensed">\s*<a href="(/[^"]+)"', html):
+        for match in re.finditer(r'class="h3 lh-condensed"[^>]*>\s*<a href="(/[^"]+)"', html):
             if count >= MAX_PAGES_PER_SOURCE_PER_RUN:
                 break
             repo_path = match.group(1).strip()
@@ -184,7 +193,7 @@ async def crawl_github_trending(queue: ContentQueue, seen: set, session: aiohttp
 
             repo_name = repo_path.strip("/")
             desc_match = re.search(
-                rf'<a href="{re.escape(repo_path)}".*?</a>.*?<p class="col-9[^"]*">\s*(.*?)\s*</p>',
+                rf'href="{re.escape(repo_path)}".*?<p[^>]*>\s*(.*?)\s*</p>',
                 html, re.DOTALL
             )
             desc = _strip_html(desc_match.group(1)) if desc_match else ""
@@ -221,33 +230,33 @@ async def crawl_papers_with_code(queue: ContentQueue, seen: set, session: aiohtt
         return
     log.info("Starting Papers With Code crawl")
 
-    html = await _fetch(session, cfg["url"])
-    if not html:
+    # PwC merged into HuggingFace — use HF trending endpoint filtered for repos with code
+    api_url = "https://huggingface.co/api/daily_papers"
+    text = await _fetch(session, api_url)
+    if not text:
+        return
+
+    import json
+    try:
+        papers = json.loads(text)
+    except json.JSONDecodeError:
+        log.warning("Failed to parse PwC/HF API response")
         return
 
     count = 0
-    for match in re.finditer(
-        r'<a href="(/paper/[^"]+)"[^>]*class="[^"]*paper-card[^"]*"',
-        html
-    ):
+    for paper in papers:
         if count >= MAX_PAGES_PER_SOURCE_PER_RUN:
             break
-        path = match.group(1)
-        url = f"https://paperswithcode.com{path}"
+        paper_data = paper.get("paper", {})
+        pid = paper_data.get("id", "")
+        url = f"https://huggingface.co/papers/{pid}"
         if url in seen:
             continue
 
-        paper_html = await _fetch(session, url)
-        if not paper_html:
+        title = paper_data.get("title", "Untitled")
+        abstract = paper_data.get("summary", "")
+        if not abstract:
             continue
-
-        title_match = re.search(r'<h1[^>]*>(.*?)</h1>', paper_html, re.DOTALL)
-        title = _strip_html(title_match.group(1)) if title_match else path.split("/")[-1]
-
-        abstract_match = re.search(
-            r'<div class="paper-abstract">\s*<p>(.*?)</p>', paper_html, re.DOTALL
-        )
-        abstract = _strip_html(abstract_match.group(1)) if abstract_match else ""
 
         seen.add(url)
         await queue.submit(ContentItem(
@@ -257,6 +266,8 @@ async def crawl_papers_with_code(queue: ContentQueue, seen: set, session: aiohtt
             content_type=ContentType.PAPER,
             raw_text=abstract,
             abstract=abstract,
+            authors=", ".join(a.get("name", "") for a in paper_data.get("authors", [])),
+            published=paper_data.get("publishedAt", "")[:10],
         ))
         count += 1
 

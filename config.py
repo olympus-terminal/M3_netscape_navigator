@@ -115,7 +115,7 @@ SOURCES = {
         "enabled": True,
         "feeds": [
             "https://blog.research.google/feeds/posts/default?alt=rss",
-            "https://ai.meta.com/blog/rss/",
+            "https://engineering.fb.com/feed/",
             "https://openai.com/blog/rss.xml",
             "https://www.anthropic.com/research/rss.xml",
             "https://deepmind.google/blog/rss.xml",
