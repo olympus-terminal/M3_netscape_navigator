@@ -1,104 +1,151 @@
-# M3_netscape_navigator
+# Codex AI Research Audio Agent
 
-Autonomous agent that crawls bleeding-edge AI research, filters it through a local LLM, and produces daily audio digests via text-to-speech.
+Autonomous agent that crawls current AI research, filters it through isolated
+`codex exec` workers, writes a technical narration script, and optionally turns
+the script into a screened MP3 digest.
 
-Designed for researchers who want technically dense, PhD-level briefings — not pop-science summaries. The agent uses an LLM as an editorial filter, scoring each piece on technical depth, novelty, and relevance, then composing a narrated script from the survivors.
+The two Codex roles are deliberately narrow:
 
-## Architecture
-
+```text
+[Crawlers] ──async──▶ [Queue] ──batches──▶ [Codex Judge]
+                                           │
+                                           ▼
+                                   [Codex Script Writer]
+                                           │
+                                           ▼
+                              [Screened Coqui TTS, p246]
 ```
-[Crawlers] ──async──▶ [Queue] ──serial──▶ [LLM Judge] ──▶ [Script Writer] ──▶ [TTS] ──▶ MP3
-```
 
-- **Crawlers** fetch from multiple sources concurrently, with human-paced delays per domain (2–5 min jitter) to stay under rate limits and avoid bot detection.
-- **Queue** keeps the LLM saturated — while it judges paper N, papers N+1 through N+5 are already fetched and waiting. No idle inference time.
-- **Judge** scores each piece 1–10 on technical depth, novelty, and relevance. Rejects pop-science rewrites, marketing announcements, and incremental results.
-- **Script writer** composes a spoken narration in dense technical prose — no filler, no hype words, numbers spelled out for TTS.
-- **TTS** synthesizes the final MP3 (optional; works without it, producing text scripts only).
+- The **judge** scores batches of papers for technical depth, novelty, and
+  relevance using a strict JSON schema.
+- The **writer** turns only accepted work into flowing, TTS-ready narration.
+- Every Codex invocation is ephemeral, non-interactive, read-only, tool-disabled,
+  and isolated in a temporary directory. Scraped text is sent through stdin as
+  untrusted data rather than included in the trusted instruction.
+- The local TTS path uses the published `gpu-tts-toolkit` with speaker `p246`,
+  pre/post-synthesis screening, and MP3 verification.
 
 ## Sources
 
-| Source | What it finds |
-|--------|--------------|
-| [arxiv](https://arxiv.org) | cs.AI, cs.LG, cs.CL, cs.CV, cs.MA, stat.ML |
-| [HuggingFace Daily Papers](https://huggingface.co/papers) | Community-curated trending papers |
-| [GitHub Trending](https://github.com/trending) | New ML repos gaining traction (Python, Rust, C++) |
-| [Papers With Code](https://paperswithcode.com) | SOTA benchmark results |
-| [Semantic Scholar](https://www.semanticscholar.org) | Recent high-impact papers by topic |
-| Lab blogs (RSS) | Google Research, Meta AI, OpenAI, Anthropic, DeepMind |
+- arXiv: `cs.AI`, `cs.LG`, `cs.CL`, `cs.CV`, `cs.MA`, and `stat.ML`
+- Hugging Face Daily Papers
+- GitHub Trending
+- Papers With Code / Hugging Face paper metadata
+- Semantic Scholar
+- Major AI lab RSS feeds
 
 ## Requirements
 
 - Python 3.11+
-- `aiohttp` (see `requirements.txt`)
-- Any OpenAI-compatible LLM API (local or remote)
-- TTS pipeline (optional — for audio output)
+- An installed Codex CLI authenticated with `codex login`
+- `aiohttp` and `python-dotenv` from `requirements.txt`
+- Optional audio: the companion
+  [`gpu-tts-toolkit`](https://github.com/olympus-terminal/gpu-tts-toolkit), a
+  Python environment containing Coqui TTS, CUDA when available, FFmpeg, and
+  `ffprobe`
 
 ## Setup
 
 ```bash
 git clone https://github.com/olympus-terminal/M3_netscape_navigator.git
 cd M3_netscape_navigator
-pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 cp .env.example .env
-# Edit .env with your LLM endpoint and optional TTS paths
+codex login status
 ```
+
+For local audio, clone the companion toolkit next to this repository and set
+its absolute paths in `.env`:
+
+```bash
+git clone https://github.com/olympus-terminal/gpu-tts-toolkit.git ../gpu-tts-toolkit
+git -C ../gpu-tts-toolkit checkout 1652e425a7ce0066dd0fba1fd540863a7fcbbbab
+```
+
+The pinned toolkit revision keeps chunk files until post-synthesis QC,
+verifies that every planned chunk exists and decodes, then allows the toolkit
+to clean intermediates. The agent fails its TTS preflight if that contract is
+missing. `patches/gpu-tts-screening.patch` is retained as an auditable backport
+for toolkit revision `7bdcde21871eb816c62432c7bb41e22336dc66b6`; apply that
+zero-context patch with `git apply --unidiff-zero`.
+
+```dotenv
+TTS_PYTHON=/path/to/miniconda3/envs/tts-app/bin/python
+TTS_SCRIPT=/path/to/gpu-tts-toolkit/media_to_tts.py
+TTS_VOICE=p246
+TTS_FORMAT=mp3
+```
+
+The public toolkit's current `media_to_tts.py` path is Coqui-based. Its generic
+SLURM example is not a ready Jubail/Qwen3 backend, so this setup intentionally
+uses local Coqui rather than submitting an unverified cluster job.
 
 ## Configuration
 
-All user-specific settings are in environment variables (`.env` file or exported directly). See `.env.example` for the full list.
+Important environment settings:
 
-**Key settings in `config.py`:**
+| Setting | Default | Purpose |
+|---|---:|---|
+| `CODEX_BIN` | detected from `PATH` | Absolute Codex CLI path is recommended for cron/systemd |
+| `CODEX_MODEL` | empty | Empty uses the CLI's current default model |
+| `CODEX_JUDGE_BATCH_SIZE` | `12` | Papers per structured Codex judge call |
+| `CODEX_JUDGE_WORKERS` | `1` | Concurrent judge processes; keep low to control quota |
+| `CODEX_MAX_JUDGE_ATTEMPTS` | `2` | Bounded attempts before a URL is left for the next run |
+| `MAX_PAGES_PER_SOURCE_PER_RUN` | `20` | Daily candidate cap per source |
+| `TARGET_AUDIO_HOURS` | `3.0` | Target narration length |
+| `MAX_NARRATION_WORDS_PER_ITEM` | `500` | Prevents sparse days from forcing padded, overlong segments |
+| `TTS_VOICE` | `p246` | Coqui VCTK speaker used for narration |
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `FOCUS_AREAS` | 12 topics | Research areas the LLM prioritizes |
-| `TECHNICAL_DEPTH_THRESHOLD` | 6 | Minimum score (1–10) to keep |
-| `NOVELTY_THRESHOLD` | 5 | Minimum novelty score |
-| `RELEVANCE_THRESHOLD` | 5 | Minimum relevance score |
-| `TARGET_AUDIO_HOURS` | 3.0 | Target digest length |
-| `DOMAIN_DELAYS` | 60–300s | Per-domain fetch intervals |
-
-Raise the thresholds for more selective output; lower them for more volume.
+One fresh `codex exec` session has meaningful fixed context overhead. Keep
+batching enabled; do not revert to one invocation per paper unless quota use is
+acceptable.
 
 ## Usage
 
 ```bash
-# Full cycle: crawl → judge → compose script → synthesize audio
-python agent.py
+# Local preflight only; no model inference or source-network call
+.venv/bin/python smoke_test.py
 
-# Crawl and judge only (no TTS) — good for testing
-python agent.py --crawl-only -v
+# Explicit opt-in live checks
+.venv/bin/python smoke_test.py --live-codex
+.venv/bin/python smoke_test.py --live-sources
+.venv/bin/python smoke_test.py --tts
 
-# Compose + synthesize from the last judged set
-python agent.py --digest-only
+# Full cycle: crawl, judge, compose, and synthesize
+.venv/bin/python agent.py
 
-# Persistent daemon — one cycle per day
-python agent.py --daemon
+# Crawl and judge without composing or TTS
+.venv/bin/python agent.py --crawl-only -v
 
-# Smoke test — verify LLM and source connectivity
-python smoke_test.py
+# Compose and synthesize from the most recent judged set
+.venv/bin/python agent.py --digest-only
+
+# One cycle per day
+.venv/bin/python agent.py --daemon
 ```
 
 ## Output
 
-```
+```text
 output/
-├── raw/        # Judged items as JSON (scores, summaries, verdicts)
-├── scripts/    # Narration scripts (plain text)
-├── audio/      # Synthesized MP3 digests
-└── digests/    # Per-digest metadata (items, scores, paths)
+├── raw/        # Accepted items, scores, summaries, and judge provenance
+├── scripts/    # Plain-text narration scripts
+├── audio/      # Synthesized MP3 directories and QC reports
+└── digests/    # Per-digest metadata
 ```
 
-`state.json` in the project root tracks previously seen URLs across runs.
+`state.json` tracks previously seen URLs. Items whose Codex attempts fail are
+removed from the seen set so a later run can retry them.
 
-## How it works
+## Tests
 
-A full cycle takes several hours by design. The crawlers deliberately pace themselves to mimic human browsing — one page every 2–5 minutes per domain, with random jitter. This is intentional: it avoids rate limiting, respects site ToS, and makes the traffic indistinguishable from a person reading papers.
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
 
-While the crawlers are slow, the LLM never waits. Multiple crawlers feed a shared async queue, and the LLM pulls items as fast as it can judge them. The bottleneck is always the intentional fetch delay, not inference speed.
-
-After judging, the agent sorts kept items by combined score, batches them into segments, and asks the LLM to compose a narration script — dense technical prose suitable for TTS. If a TTS pipeline is configured, it synthesizes the script into an MP3.
+The deterministic suite uses a fake Codex executable and does not consume model
+quota. Live inference remains opt-in through `smoke_test.py --live-codex`.
 
 ## License
 

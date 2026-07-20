@@ -13,12 +13,42 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-# === LLM inference endpoint (any OpenAI-compatible API) ===
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8080/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "default")
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "none")
-LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "4096"))
-LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.3"))
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    value = int(os.environ.get(name, str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    value = float(os.environ.get(name, str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+# === Codex agents ===
+# Saved `codex login` authentication is reused. CODEX_MODEL is intentionally
+# empty by default so the installed CLI can select its current default model.
+CODEX_BIN = os.environ.get("CODEX_BIN", shutil.which("codex") or "codex")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "").strip()
+CODEX_IGNORE_USER_CONFIG = _env_bool("CODEX_IGNORE_USER_CONFIG", True)
+CODEX_JUDGE_TIMEOUT_SECONDS = _env_positive_int("CODEX_JUDGE_TIMEOUT_SECONDS", 900)
+CODEX_WRITER_TIMEOUT_SECONDS = _env_positive_int("CODEX_WRITER_TIMEOUT_SECONDS", 1800)
+CODEX_JUDGE_BATCH_SIZE = _env_positive_int("CODEX_JUDGE_BATCH_SIZE", 12)
+CODEX_JUDGE_BATCH_WAIT_SECONDS = _env_positive_float("CODEX_JUDGE_BATCH_WAIT_SECONDS", 5)
+CODEX_JUDGE_WORKERS = _env_positive_int("CODEX_JUDGE_WORKERS", 1)
+CODEX_MAX_JUDGE_ATTEMPTS = _env_positive_int("CODEX_MAX_JUDGE_ATTEMPTS", 2)
+CODEX_MAX_WRITER_ATTEMPTS = _env_positive_int("CODEX_MAX_WRITER_ATTEMPTS", 2)
+CODEX_RETRY_DELAY_SECONDS = _env_positive_float("CODEX_RETRY_DELAY_SECONDS", 5)
 
 # === TTS (optional — omit to skip audio synthesis) ===
 TTS_CONDA_PYTHON = os.environ.get("TTS_PYTHON", shutil.which("python3") or "python3")
@@ -54,8 +84,7 @@ DOMAIN_DELAYS = {
 }
 
 MAX_CONCURRENT_FETCHERS = 4
-MAX_PAGES_PER_SOURCE_PER_RUN = 50
-MAX_QUEUE_SIZE = 200
+MAX_PAGES_PER_SOURCE_PER_RUN = _env_positive_int("MAX_PAGES_PER_SOURCE_PER_RUN", 20)
 
 # === Content filtering ===
 # LLM scores each piece 1–10 on these axes; must meet all thresholds to keep.
@@ -64,9 +93,10 @@ NOVELTY_THRESHOLD = 5
 RELEVANCE_THRESHOLD = 5
 
 # === Digest settings ===
-TARGET_AUDIO_HOURS = float(os.environ.get("TARGET_AUDIO_HOURS", "3.0"))
+TARGET_AUDIO_HOURS = _env_positive_float("TARGET_AUDIO_HOURS", 3.0)
 WORDS_PER_MINUTE = 150
 TARGET_WORD_COUNT = int(TARGET_AUDIO_HOURS * 60 * WORDS_PER_MINUTE)
+MAX_NARRATION_WORDS_PER_ITEM = _env_positive_int("MAX_NARRATION_WORDS_PER_ITEM", 500)
 
 # === Research focus areas (guides the LLM's editorial taste) ===
 FOCUS_AREAS = [

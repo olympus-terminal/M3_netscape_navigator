@@ -1,0 +1,98 @@
+diff --git a/deep_voice_tts.py b/deep_voice_tts.py
+index 5ffd41e..574cb75 100644
+--- a/deep_voice_tts.py
++++ b/deep_voice_tts.py
+@@ -407 +407 @@ class DeepVoiceTTS:
+-    def process_text_file(self, input_file, output_name=None):
++    def process_text_file(self, input_file, output_name=None, preserve_chunks=False):
+@@ -409 +409,4 @@ class DeepVoiceTTS:
+-        Process text file with deep voice generation
++        Process text file with deep voice generation.
++
++        Set ``preserve_chunks`` when a caller needs to inspect chunk text and
++        audio before performing its own cleanup (for example, QC screening).
+@@ -487,4 +490,4 @@ class DeepVoiceTTS:
+-                # Clean up intermediate chunk files
+-                print("🧹 Cleaning up intermediate chunks...")
+-                shutil.rmtree(chunks_dir)
+-                print("✓ Chunks deleted")
++                if not preserve_chunks:
++                    print("🧹 Cleaning up intermediate chunks...")
++                    shutil.rmtree(chunks_dir)
++                    print("✓ Chunks deleted")
+@@ -545 +548 @@ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/media_to_tts.py b/media_to_tts.py
+index 7698766..a2274b5 100755
+--- a/media_to_tts.py
++++ b/media_to_tts.py
+@@ -1538,0 +1539 @@ class TTSHallucinationScreener:
++        planned_chunks = None
+@@ -1542,0 +1544 @@ class TTSHallucinationScreener:
++            planned_chunks = meta.get('chunks')
+@@ -1545,0 +1548,2 @@ class TTSHallucinationScreener:
++        screened_text_chunks = 0
++        screened_audio_chunks = 0
+@@ -1546,0 +1551 @@ class TTSHallucinationScreener:
++            screened_text_chunks = len(list(chunks_dir.glob('chunk_*.txt')))
+@@ -1551,0 +1557 @@ class TTSHallucinationScreener:
++            screened_audio_chunks = len(chunk_files)
+@@ -1576,0 +1583,41 @@ class TTSHallucinationScreener:
++                # Require every chunk to decode and report a positive duration.
++                try:
++                    probe = subprocess.run(
++                        [
++                            'ffprobe', '-v', 'error',
++                            '-show_entries', 'format=duration',
++                            '-of', 'default=noprint_wrappers=1:nokey=1',
++                            str(af),
++                        ],
++                        capture_output=True,
++                        text=True,
++                        timeout=30,
++                    )
++                    duration = float(probe.stdout.strip()) if probe.returncode == 0 else 0.0
++                except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
++                    duration = 0.0
++                if duration <= 0:
++                    report['audio_issues'].append({
++                        'type': 'UNREADABLE_AUDIO',
++                        'file': af.name,
++                        'description': f'{af.name} could not be decoded or has zero duration',
++                    })
++
++        if type(planned_chunks) is int and planned_chunks >= 0:
++            if screened_text_chunks != planned_chunks:
++                report['audio_issues'].append({
++                    'type': 'INCOMPLETE_TEXT_CHUNKS',
++                    'description': (
++                        f'Expected {planned_chunks} chunk transcripts, found '
++                        f'{screened_text_chunks}'
++                    ),
++                })
++            if screened_audio_chunks != planned_chunks:
++                report['audio_issues'].append({
++                    'type': 'INCOMPLETE_AUDIO_CHUNKS',
++                    'description': (
++                        f'Expected {planned_chunks} audio chunks, found '
++                        f'{screened_audio_chunks}'
++                    ),
++                })
++
+@@ -1579,0 +1627,2 @@ class TTSHallucinationScreener:
++            'screened_text_chunks': screened_text_chunks,
++            'screened_audio_chunks': screened_audio_chunks,
+@@ -1735 +1784,4 @@ def main():
+-                tts_output_dir = tts.process_text_file(out_path)
++                tts_output_dir = tts.process_text_file(
++                    out_path,
++                    preserve_chunks=args.screen,
++                )
+@@ -1861 +1913,4 @@ def main():
+-            tts_output_dir = tts.process_text_file(out_path)
++            tts_output_dir = tts.process_text_file(
++                out_path,
++                preserve_chunks=args.screen,
++            )

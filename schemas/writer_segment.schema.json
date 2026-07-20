@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "covered_item_indices": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 1 }
+    },
+    "segment": { "type": "string" }
+  },
+  "required": ["covered_item_indices", "segment"],
+  "additionalProperties": false
+}

@@ -4,7 +4,7 @@ AI Research Agent — persistent daemon that crawls, judges, and narrates
 bleeding-edge AI research into daily audio digests.
 
 Architecture:
-  [Crawlers] --async--> [Queue] --serial--> [LLM Judge] --> [Script Writer] --> [TTS]
+  [Crawlers] --async--> [Queue] --> [Codex Judge] --> [Codex Writer] --> [TTS]
 
   Crawlers run concurrently across domains with human-paced delays.
   The LLM stays saturated — always has the next item ready from the queue.
@@ -27,17 +27,20 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from codex_backend import CodexExecError, preflight_codex
 from config import (
     BASE_DIR,
+    CODEX_JUDGE_WORKERS,
     LOG_FILE,
     OUTPUT_DIR,
     RAW_DIR,
     STATE_FILE,
     TARGET_WORD_COUNT,
+    TTS_ENABLED,
     WORDS_PER_MINUTE,
 )
 from crawlers import run_all_crawlers
-from digest import compose_digest_script, save_digest_metadata, synthesize_audio
+from digest import compose_digest_script, preflight_tts, save_digest_metadata, synthesize_audio
 from judge import judge_loop
 from queue_manager import ContentQueue
 
@@ -73,40 +76,140 @@ def save_state(state: dict):
 
 # ─── Core cycle ─────────────────────────────────────────────────────────────
 
+async def _run_crawlers_with_judge_supervision(
+    queue: ContentQueue,
+    seen: set,
+    judge_tasks: list[asyncio.Task],
+):
+    """Run crawlers while failing promptly if a judge worker terminates."""
+    crawl_task = asyncio.create_task(run_all_crawlers(queue, seen))
+    try:
+        done, _ = await asyncio.wait(
+            [crawl_task, *judge_tasks],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if crawl_task in done:
+            await crawl_task
+            return
+
+        for task in (task for task in done if task in judge_tasks):
+            if task.cancelled():
+                raise RuntimeError("Codex judge worker was cancelled during crawling")
+            exception = task.exception()
+            if exception is not None:
+                raise RuntimeError("Codex judge worker crashed during crawling") from exception
+        raise RuntimeError("Codex judge worker exited during crawling")
+    finally:
+        if not crawl_task.done():
+            crawl_task.cancel()
+            await asyncio.gather(crawl_task, return_exceptions=True)
+
+
+async def _drain_judges(
+    queue: ContentQueue,
+    judge_tasks: list[asyncio.Task],
+    stop_event: asyncio.Event,
+):
+    """Wait for queue completion while surfacing worker crashes immediately."""
+    join_task = asyncio.create_task(queue.join_pending())
+    try:
+        done, _ = await asyncio.wait(
+            [join_task, *judge_tasks],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if join_task in done:
+            await join_task
+            stop_event.set()
+            await asyncio.gather(*judge_tasks)
+            return
+
+        completed_workers = [task for task in done if task in judge_tasks]
+        for task in completed_workers:
+            if task.cancelled():
+                raise RuntimeError("Codex judge worker was cancelled before the queue drained")
+            exception = task.exception()
+            if exception is not None:
+                raise RuntimeError("Codex judge worker crashed") from exception
+        raise RuntimeError("Codex judge worker exited before the queue drained")
+    finally:
+        if not join_task.done():
+            join_task.cancel()
+            await asyncio.gather(join_task, return_exceptions=True)
+
+
+async def _cancel_judges(judge_tasks: list[asyncio.Task], stop_event: asyncio.Event):
+    stop_event.set()
+    for task in judge_tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*judge_tasks, return_exceptions=True)
+
+
 async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = False):
+    try:
+        await preflight_codex()
+    except CodexExecError as exc:
+        raise RuntimeError(f"Codex preflight failed: {exc}") from exc
+    if digest and TTS_ENABLED:
+        try:
+            tts_runtime = await asyncio.to_thread(preflight_tts)
+            log.info(
+                "TTS preflight passed: Coqui %s, Torch %s, CUDA=%s, voice=%s",
+                tts_runtime.get("tts"),
+                tts_runtime.get("torch"),
+                tts_runtime.get("cuda_available"),
+                tts_runtime.get("voice"),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"TTS preflight failed: {exc}") from exc
+
     state = load_state()
     seen = set(state.get("seen_urls", []))
     queue = ContentQueue()
     stop_event = asyncio.Event()
+    cycle_success = True
 
     log.info(f"=== Cycle start === (seen: {len(seen)} URLs)")
 
     if crawl:
-        # start the judge in the background — it will process items as they arrive
-        judge_task = asyncio.create_task(judge_loop(queue, stop_event))
+        # Start bounded judge workers in the background. Each worker batches
+        # items into one Codex invocation to avoid paying CLI context overhead
+        # for every individual paper.
+        judge_tasks = [
+            asyncio.create_task(judge_loop(queue, stop_event))
+            for _ in range(max(1, CODEX_JUDGE_WORKERS))
+        ]
 
-        # run all crawlers — they feed the queue concurrently
-        log.info("Starting crawlers...")
-        await run_all_crawlers(queue, seen)
+        try:
+            # run all crawlers — they feed the queue concurrently
+            log.info("Starting crawlers...")
+            await _run_crawlers_with_judge_supervision(queue, seen, judge_tasks)
 
-        # wait for the judge to finish processing remaining items
-        log.info(f"Crawlers done. Waiting for judge to finish ({queue.pending_count()} pending)...")
-        while queue.pending_count() > 0:
-            await asyncio.sleep(5)
-
-        # give judge a moment to finish the last item
-        await asyncio.sleep(10)
-        stop_event.set()
-        await judge_task
+            # Wait for all in-flight calls and bounded retries. Queue.join
+            # tracks work after get(); _drain_judges also watches workers so a
+            # crash cannot leave join waiting forever.
+            log.info(
+                "Crawlers done. Waiting for judge to finish (%s pending)...",
+                queue.pending_count(),
+            )
+            await _drain_judges(queue, judge_tasks, stop_event)
+        except BaseException:
+            await _cancel_judges(judge_tasks, stop_event)
+            raise
 
         log.info(
             f"Judging complete: {queue.stats['kept']}/{queue.stats['judged']} kept "
-            f"({queue.stats['skipped']} skipped)"
+            f"({queue.stats['skipped']} skipped, {queue.stats['failed']} failed, "
+            f"{queue.stats['retried']} retries)"
         )
 
         # save raw judged items
         RAW_DIR.mkdir(parents=True, exist_ok=True)
         kept_items = await queue.drain_kept()
+        failed_items = await queue.drain_failed()
+        for item in failed_items:
+            # A temporary Codex failure must not permanently mark the URL seen.
+            seen.discard(item.url)
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         raw_path = RAW_DIR / f"judged_{stamp}.json"
@@ -125,6 +228,8 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
                     },
                     "summary": item.summary,
                     "key_contributions": item.key_contributions,
+                    "reason": item.judge_reason,
+                    "judge_attempts": item.judge_attempts,
                     "abstract": item.abstract,
                 }
                 for item in kept_items
@@ -160,6 +265,8 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
             item.relevance = scores.get("relevance")
             item.summary = d.get("summary", "")
             item.key_contributions = d.get("key_contributions", "")
+            item.judge_reason = d.get("reason", "")
+            item.judge_attempts = d.get("judge_attempts", 0)
             item.verdict = "keep"
             kept_items.append(item)
 
@@ -179,17 +286,38 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
         script_path = await compose_digest_script(kept_items)
         if script_path:
             log.info("Starting TTS synthesis (this will take a while)...")
-            audio_path = synthesize_audio(script_path)
-            save_digest_metadata(kept_items, script_path, audio_path)
+            audio_result = synthesize_audio(script_path)
+            save_digest_metadata(kept_items, script_path, audio_result)
 
-            if audio_path:
-                log.info(f"=== DIGEST READY: {audio_path} ===")
+            if audio_result and audio_result.approved:
+                log.info("=== DIGEST READY: %s ===", audio_result.path)
+                state["pending_digest"] = False
             else:
-                log.warning(f"TTS failed. Script saved at: {script_path}")
+                if TTS_ENABLED:
+                    cycle_success = False
+                    state["pending_digest"] = True
+                    if audio_result:
+                        log.error(
+                            "TTS needs review (%s). Audio=%s manifest=%s",
+                            audio_result.qc_status,
+                            audio_result.path,
+                            audio_result.manifest_path,
+                        )
+                    else:
+                        log.error(
+                            "TTS failed QC. Script saved for digest-only retry: %s",
+                            script_path,
+                        )
+                else:
+                    state["pending_digest"] = False
+                    log.info("TTS is disabled. Script ready at: %s", script_path)
         else:
             log.error("Failed to compose digest script")
+            cycle_success = False
+            state["pending_digest"] = True
     elif digest:
         log.warning("No items passed filtering — no digest to compose")
+        state["pending_digest"] = False
 
     # update state
     state["seen_urls"] = list(seen)
@@ -198,6 +326,7 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
     save_state(state)
 
     log.info(f"=== Cycle complete === (total seen: {len(seen)})")
+    return cycle_success
 
 
 # ─── Daemon mode ─────────────────────────────────────────────────────────────
@@ -215,14 +344,22 @@ async def daemon_loop(verbose: bool = False):
     signal.signal(signal.SIGTERM, handle_signal)
 
     while not shutdown.is_set():
+        cycle_success = False
         try:
-            await run_cycle(crawl=True, digest=True, verbose=verbose)
+            pending_digest = bool(load_state().get("pending_digest", False))
+            if pending_digest:
+                log.info("Retrying the pending digest before crawling new content")
+            cycle_success = await run_cycle(
+                crawl=not pending_digest,
+                digest=True,
+                verbose=verbose,
+            )
         except Exception as e:
             log.error(f"Cycle failed: {e}", exc_info=True)
 
         # sleep until next cycle (with periodic wake to check shutdown)
-        next_run = 24 * 3600  # 24 hours
-        log.info(f"Next cycle in {next_run / 3600:.0f} hours. Sleeping...")
+        next_run = 24 * 3600 if cycle_success else 3600
+        log.info("Next cycle in %.0f hours. Sleeping...", next_run / 3600)
         try:
             await asyncio.wait_for(shutdown.wait(), timeout=next_run)
         except asyncio.TimeoutError:
@@ -252,11 +389,17 @@ def main():
     if args.daemon:
         asyncio.run(daemon_loop(verbose=args.verbose))
     elif args.crawl_only:
-        asyncio.run(run_cycle(crawl=True, digest=False, verbose=args.verbose))
+        success = asyncio.run(run_cycle(crawl=True, digest=False, verbose=args.verbose))
+        if not success:
+            sys.exit(1)
     elif args.digest_only:
-        asyncio.run(run_cycle(crawl=False, digest=True, verbose=args.verbose))
+        success = asyncio.run(run_cycle(crawl=False, digest=True, verbose=args.verbose))
+        if not success:
+            sys.exit(1)
     else:
-        asyncio.run(run_cycle(verbose=args.verbose))
+        success = asyncio.run(run_cycle(verbose=args.verbose))
+        if not success:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
