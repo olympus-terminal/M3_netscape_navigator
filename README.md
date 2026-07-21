@@ -60,7 +60,7 @@ its absolute paths in `.env`:
 
 ```bash
 git clone https://github.com/olympus-terminal/gpu-tts-toolkit.git ../gpu-tts-toolkit
-git -C ../gpu-tts-toolkit checkout 1652e425a7ce0066dd0fba1fd540863a7fcbbbab
+git -C ../gpu-tts-toolkit checkout 0e83937d613a561fe1625091caeb36889b2f9138
 ```
 
 The pinned toolkit revision keeps chunk files until post-synthesis QC,
@@ -136,7 +136,9 @@ output/
 ```
 
 `state.json` tracks previously seen URLs. Items whose Codex attempts fail are
-removed from the seen set so a later run can retry them.
+removed from the seen set so a later run can retry them. A synthesis failure is
+retried after one hour; a complete `REVIEW_NEEDED` artifact is retained for
+human inspection without regenerating the same multi-hour digest.
 
 ## Tests
 

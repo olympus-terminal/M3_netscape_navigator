@@ -25,21 +25,44 @@ index 5ffd41e..574cb75 100644
 \ No newline at end of file
 +    main()
 diff --git a/media_to_tts.py b/media_to_tts.py
-index 7698766..a2274b5 100755
+index 7698766..84ec50b 100755
 --- a/media_to_tts.py
 +++ b/media_to_tts.py
-@@ -1538,0 +1539 @@ class TTSHallucinationScreener:
+@@ -1455 +1455 @@ class TTSHallucinationScreener:
+-        (r'\b(\w{3,})\s+\1\b', 'WORD_REPEAT',
++        (r"(?i)(?<![\w'-])(\w{3,})(?:\s+\1(?![\w'-]))+", 'WORD_REPEAT',
+@@ -1479,0 +1480,12 @@ class TTSHallucinationScreener:
++    # A pair of adjacent number words is normal in spoken years, decimals,
++    # identifiers, and benchmark values (for example, "twenty twenty" or "two
++    # two percent"). Three or more copies still indicate a possible loop. Scale
++    # words such as "hundred" and "million" remain screened because repeating
++    # those is much more likely to be an editing error.
++    _BENIGN_NUMERIC_REPEATS = frozenset({
++        'zero', 'oh', 'one', 'two', 'three', 'four', 'five', 'six', 'seven',
++        'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen',
++        'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen', 'twenty',
++        'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety',
++    })
++
+@@ -1493,0 +1506,6 @@ class TTSHallucinationScreener:
++                    if (
++                        name == 'WORD_REPEAT'
++                        and m.group(1).casefold() in self._BENIGN_NUMERIC_REPEATS
++                        and len(m.group().split()) == 2
++                    ):
++                        continue
+@@ -1538,0 +1557 @@ class TTSHallucinationScreener:
 +        planned_chunks = None
-@@ -1542,0 +1544 @@ class TTSHallucinationScreener:
+@@ -1542,0 +1562 @@ class TTSHallucinationScreener:
 +            planned_chunks = meta.get('chunks')
-@@ -1545,0 +1548,2 @@ class TTSHallucinationScreener:
+@@ -1545,0 +1566,2 @@ class TTSHallucinationScreener:
 +        screened_text_chunks = 0
 +        screened_audio_chunks = 0
-@@ -1546,0 +1551 @@ class TTSHallucinationScreener:
+@@ -1546,0 +1569 @@ class TTSHallucinationScreener:
 +            screened_text_chunks = len(list(chunks_dir.glob('chunk_*.txt')))
-@@ -1551,0 +1557 @@ class TTSHallucinationScreener:
+@@ -1551,0 +1575 @@ class TTSHallucinationScreener:
 +            screened_audio_chunks = len(chunk_files)
-@@ -1576,0 +1583,41 @@ class TTSHallucinationScreener:
+@@ -1576,0 +1601,41 @@ class TTSHallucinationScreener:
 +                # Require every chunk to decode and report a positive duration.
 +                try:
 +                    probe = subprocess.run(
@@ -81,16 +104,16 @@ index 7698766..a2274b5 100755
 +                    ),
 +                })
 +
-@@ -1579,0 +1627,2 @@ class TTSHallucinationScreener:
+@@ -1579,0 +1645,2 @@ class TTSHallucinationScreener:
 +            'screened_text_chunks': screened_text_chunks,
 +            'screened_audio_chunks': screened_audio_chunks,
-@@ -1735 +1784,4 @@ def main():
+@@ -1735 +1802,4 @@ def main():
 -                tts_output_dir = tts.process_text_file(out_path)
 +                tts_output_dir = tts.process_text_file(
 +                    out_path,
 +                    preserve_chunks=args.screen,
 +                )
-@@ -1861 +1913,4 @@ def main():
+@@ -1861 +1931,4 @@ def main():
 -            tts_output_dir = tts.process_text_file(out_path)
 +            tts_output_dir = tts.process_text_file(
 +                out_path,

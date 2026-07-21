@@ -74,6 +74,29 @@ def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
+def _record_tts_outcome(state: dict, audio_result) -> bool:
+    """Persist whether a digest should be retried; return cycle success."""
+    if audio_result is None:
+        state["pending_digest"] = True
+        return False
+
+    state["pending_digest"] = False
+    if audio_result.approved:
+        state.pop("pending_review", None)
+    else:
+        # A complete review artifact needs human attention, not another costly
+        # writer/TTS run over the same judged set. Preserve its exact paths and
+        # continue on the normal daily cadence.
+        state["pending_review"] = {
+            "recorded_at": datetime.now().isoformat(),
+            "qc_status": audio_result.qc_status,
+            "audio": str(audio_result.path.resolve()),
+            "manifest": str(audio_result.manifest_path.resolve()),
+            "screening_report": str(audio_result.screening_report_path.resolve()),
+        }
+    return True
+
+
 # ─── Core cycle ─────────────────────────────────────────────────────────────
 
 async def _run_crawlers_with_judge_supervision(
@@ -289,28 +312,27 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
             audio_result = synthesize_audio(script_path)
             save_digest_metadata(kept_items, script_path, audio_result)
 
-            if audio_result and audio_result.approved:
-                log.info("=== DIGEST READY: %s ===", audio_result.path)
-                state["pending_digest"] = False
-            else:
-                if TTS_ENABLED:
-                    cycle_success = False
-                    state["pending_digest"] = True
-                    if audio_result:
-                        log.error(
-                            "TTS needs review (%s). Audio=%s manifest=%s",
-                            audio_result.qc_status,
-                            audio_result.path,
-                            audio_result.manifest_path,
-                        )
-                    else:
-                        log.error(
-                            "TTS failed QC. Script saved for digest-only retry: %s",
-                            script_path,
-                        )
+            if TTS_ENABLED:
+                cycle_success = _record_tts_outcome(state, audio_result)
+                if audio_result and audio_result.approved:
+                    log.info("=== DIGEST READY: %s ===", audio_result.path)
+                elif audio_result:
+                    log.error(
+                        "TTS needs review (%s). Audio=%s manifest=%s. "
+                        "Artifact preserved without automatic regeneration.",
+                        audio_result.qc_status,
+                        audio_result.path,
+                        audio_result.manifest_path,
+                    )
                 else:
-                    state["pending_digest"] = False
-                    log.info("TTS is disabled. Script ready at: %s", script_path)
+                    log.error(
+                        "TTS failed QC. Script saved for digest-only retry: %s",
+                        script_path,
+                    )
+            else:
+                state["pending_digest"] = False
+                state.pop("pending_review", None)
+                log.info("TTS is disabled. Script ready at: %s", script_path)
         else:
             log.error("Failed to compose digest script")
             cycle_success = False

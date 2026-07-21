@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import agent
@@ -278,6 +279,46 @@ class TTSTests(unittest.TestCase):
             self.assertFalse(output.approved)
             self.assertEqual(output.qc_status, "review_needed")
             self.assertTrue(output.manifest_path.is_file())
+
+
+class TTSOutcomeStateTests(unittest.TestCase):
+    def _result(self, root: Path, *, approved: bool):
+        return SimpleNamespace(
+            approved=approved,
+            qc_status="structural_clean" if approved else "review_needed",
+            path=root / "digest.mp3",
+            manifest_path=root / "tts_manifest.json",
+            screening_report_path=root / "hallucination_report.json",
+        )
+
+    def test_review_artifact_waits_for_human_instead_of_hourly_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = {"pending_digest": True}
+            cycle_success = agent._record_tts_outcome(
+                state,
+                self._result(Path(temp), approved=False),
+            )
+
+        self.assertTrue(cycle_success)
+        self.assertFalse(state["pending_digest"])
+        self.assertEqual(state["pending_review"]["qc_status"], "review_needed")
+
+    def test_missing_audio_is_retried(self):
+        state = {"pending_digest": False}
+        self.assertFalse(agent._record_tts_outcome(state, None))
+        self.assertTrue(state["pending_digest"])
+
+    def test_approved_audio_clears_an_older_review(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = {"pending_digest": True, "pending_review": {"old": True}}
+            cycle_success = agent._record_tts_outcome(
+                state,
+                self._result(Path(temp), approved=True),
+            )
+
+        self.assertTrue(cycle_success)
+        self.assertFalse(state["pending_digest"])
+        self.assertNotIn("pending_review", state)
 
 
 if __name__ == "__main__":
