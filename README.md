@@ -127,11 +127,25 @@ acceptable.
 
 ## Output
 
+Finished audio is placed directly in the repository root with a local-time
+timestamp and UTC offset:
+
+```text
+ai_research_digest_2026-07-23_11-30-00+0400.mp3
+ai_research_digest_2026-07-23_11-30-00+0400_REVIEW_NEEDED.mp3
+```
+
+Files carrying `REVIEW_NEEDED` are complete and structurally verified, but have
+a screening flag that still requires inspection. They are never silently called
+clean. A historical file carrying `MANUALLY_ACCEPTED` has an explicit acceptance
+record while its original machine report remains unchanged. Internal evidence
+remains under `output/`:
+
 ```text
 output/
 ├── raw/        # Accepted items, scores, summaries, and judge provenance
 ├── scripts/    # Plain-text narration scripts
-├── audio/      # Synthesized MP3 directories and QC reports
+├── audio/      # TTS working files, QC reports, and manifests
 └── digests/    # Per-digest metadata
 ```
 

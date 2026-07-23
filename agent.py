@@ -24,7 +24,7 @@ import json
 import logging
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from codex_backend import CodexExecError, preflight_codex
@@ -61,6 +61,9 @@ def setup_logging(verbose: bool = False):
 
 log = logging.getLogger("agent")
 
+_DAILY_INTERVAL = timedelta(days=1)
+_RETRY_INTERVAL = timedelta(hours=1)
+
 
 # ─── State persistence ──────────────────────────────────────────────────────
 
@@ -72,6 +75,59 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def _local_now() -> datetime:
+    """Return an aware local timestamp for persisted scheduling state."""
+    return datetime.now().astimezone()
+
+
+def _parse_state_time(value, local_tz) -> datetime | None:
+    """Parse persisted ISO time, treating legacy naive values as local time."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=local_tz)
+    return parsed
+
+
+def _scheduled_run_from_state(state: dict, now: datetime) -> datetime | None:
+    """Return the earliest safe next cycle time represented by daemon state."""
+    if now.tzinfo is None:
+        raise ValueError("now must include a timezone")
+
+    persisted = _parse_state_time(state.get("next_run_at"), now.tzinfo)
+    last_run = _parse_state_time(state.get("last_run"), now.tzinfo)
+    derived = None
+    if last_run is not None:
+        interval = _RETRY_INTERVAL if state.get("pending_digest") else _DAILY_INTERVAL
+        derived = last_run + interval
+
+    candidates = [candidate for candidate in (persisted, derived) if candidate is not None]
+    if not candidates:
+        return None
+
+    # run_cycle writes last_run before the daemon records its next_run_at.
+    # Taking the later value closes that small restart window: a stale, elapsed
+    # next_run_at cannot cause a duplicate crawl after a completed cycle.
+    return max(candidates)
+
+
+def _persist_next_run(cycle_success: bool, now: datetime | None = None) -> datetime:
+    """Persist and return the next daemon attempt time."""
+    now = now or _local_now()
+    if now.tzinfo is None:
+        raise ValueError("now must include a timezone")
+    interval = _DAILY_INTERVAL if cycle_success else _RETRY_INTERVAL
+    next_run_at = now + interval
+    state = load_state()
+    state["next_run_at"] = next_run_at.isoformat()
+    save_state(state)
+    return next_run_at
 
 
 def _record_tts_outcome(state: dict, audio_result) -> bool:
@@ -88,7 +144,7 @@ def _record_tts_outcome(state: dict, audio_result) -> bool:
         # writer/TTS run over the same judged set. Preserve its exact paths and
         # continue on the normal daily cadence.
         state["pending_review"] = {
-            "recorded_at": datetime.now().isoformat(),
+            "recorded_at": _local_now().isoformat(),
             "qc_status": audio_result.qc_status,
             "audio": str(audio_result.path.resolve()),
             "manifest": str(audio_result.manifest_path.resolve()),
@@ -343,7 +399,11 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
 
     # update state
     state["seen_urls"] = list(seen)
-    state["last_run"] = datetime.now().isoformat()
+    state["last_run"] = _local_now().isoformat()
+    # Any previously scheduled time belongs to the cycle that just finished.
+    # Removing it here makes a restart derive the correct daily/hourly delay
+    # from this last_run until daemon_loop persists the new exact schedule.
+    state.pop("next_run_at", None)
     state["runs"] = state.get("runs", 0) + 1
     save_state(state)
 
@@ -357,13 +417,32 @@ async def daemon_loop(verbose: bool = False):
     log.info("Agent daemon started — will run one cycle per day")
 
     shutdown = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
     def handle_signal(sig, _):
         log.info(f"Received {signal.Signals(sig).name}, shutting down gracefully...")
-        shutdown.set()
+        # Python may transparently restart the selector syscall after this
+        # synchronous signal handler returns. Scheduling thread-safely writes
+        # to the loop's wakeup pipe so a long daily sleep ends immediately.
+        loop.call_soon_threadsafe(shutdown.set)
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+
+    now = _local_now()
+    scheduled_run = _scheduled_run_from_state(load_state(), now)
+    if scheduled_run is not None:
+        remaining = max(0.0, (scheduled_run - now).total_seconds())
+        if remaining:
+            log.info(
+                "Next cycle scheduled for %s (in %.2f hours). Sleeping...",
+                scheduled_run.isoformat(timespec="seconds"),
+                remaining / 3600,
+            )
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                pass
 
     while not shutdown.is_set():
         cycle_success = False
@@ -379,11 +458,26 @@ async def daemon_loop(verbose: bool = False):
         except Exception as e:
             log.error(f"Cycle failed: {e}", exc_info=True)
 
-        # sleep until next cycle (with periodic wake to check shutdown)
-        next_run = 24 * 3600 if cycle_success else 3600
-        log.info("Next cycle in %.0f hours. Sleeping...", next_run / 3600)
+        # Persist the delay before sleeping so a service restart honors the
+        # remaining daily/retry interval instead of immediately starting over.
+        now = _local_now()
+        interval = _DAILY_INTERVAL if cycle_success else _RETRY_INTERVAL
+        next_run_at = now + interval
         try:
-            await asyncio.wait_for(shutdown.wait(), timeout=next_run)
+            next_run_at = _persist_next_run(cycle_success, now)
+        except Exception:
+            log.error(
+                "Could not persist next cycle time; restart safety is unavailable",
+                exc_info=True,
+            )
+        remaining = max(0.0, (next_run_at - _local_now()).total_seconds())
+        log.info(
+            "Next cycle scheduled for %s (in %.2f hours). Sleeping...",
+            next_run_at.isoformat(timespec="seconds"),
+            remaining / 3600,
+        )
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=remaining)
         except asyncio.TimeoutError:
             pass
 

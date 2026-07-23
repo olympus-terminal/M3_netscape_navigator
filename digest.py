@@ -1,6 +1,7 @@
 """Compose a narration script from judged content, then synthesize to MP3."""
 
 import asyncio
+import errno
 import hashlib
 import json
 import logging
@@ -19,6 +20,7 @@ from config import (
     CODEX_MAX_WRITER_ATTEMPTS,
     CODEX_RETRY_DELAY_SECONDS,
     CODEX_WRITER_TIMEOUT_SECONDS,
+    DELIVERY_DIR,
     DIGEST_DIR,
     MAX_NARRATION_WORDS_PER_ITEM,
     SCRIPT_DIR_OUT,
@@ -53,6 +55,89 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _write_json_atomic(path: Path, payload: dict):
+    """Replace a JSON file only after its complete contents are on disk."""
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _publish_delivery_audio(
+    source: Path,
+    qc_status: str,
+    published_at: datetime | None = None,
+) -> tuple[Path, str, datetime]:
+    """Atomically expose a verified audio artifact at the user-facing top level."""
+    published_at = published_at or datetime.now().astimezone()
+    if published_at.utcoffset() is None:
+        raise ValueError("Delivery timestamp must include a UTC offset")
+    stamp = published_at.strftime("%Y-%m-%d_%H-%M-%S%z")
+    review_suffix = "_REVIEW_NEEDED" if qc_status == "review_needed" else ""
+
+    DELIVERY_DIR.mkdir(parents=True, exist_ok=True)
+
+    def candidates():
+        for sequence in range(1, 100):
+            collision_suffix = "" if sequence == 1 else f"_{sequence:02d}"
+            yield DELIVERY_DIR / (
+                f"ai_research_digest_{stamp}{collision_suffix}"
+                f"{review_suffix}{source.suffix.lower()}"
+            )
+
+    unsupported = {errno.EXDEV, errno.EPERM}
+    if hasattr(errno, "EOPNOTSUPP"):
+        unsupported.add(errno.EOPNOTSUPP)
+
+    # A hard link is instantly visible, cannot replace an existing destination,
+    # and consumes no duplicate disk space. The caller removes the staging name
+    # only after the nested manifest has been persisted.
+    for destination in candidates():
+        try:
+            os.link(source, destination)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise
+            break
+        if not destination.is_file() or destination.stat().st_size != source.stat().st_size:
+            destination.unlink(missing_ok=True)
+            raise RuntimeError(f"Published audio failed verification: {destination}")
+        return destination, "hardlink", published_at
+    else:
+        raise FileExistsError(f"No unused delivery name for timestamp {stamp}")
+
+    # Cross-filesystem publication cannot link the source directly. Copy to a
+    # hidden unique file, verify it in full, then hard-link that verified inode
+    # to an unused public name. The public MP3 is therefore never partial and
+    # an interrupted copy cannot leave a misleading delivery file behind.
+    temporary = DELIVERY_DIR / f".ai_research_digest_publish_{uuid.uuid4().hex}.tmp"
+    try:
+        shutil.copy2(source, temporary)
+        if (
+            not temporary.is_file()
+            or temporary.stat().st_size != source.stat().st_size
+            or _sha256_file(temporary) != _sha256_file(source)
+        ):
+            raise RuntimeError(f"Copied audio failed verification: {temporary}")
+
+        for destination in candidates():
+            try:
+                os.link(temporary, destination)
+            except FileExistsError:
+                continue
+            if not destination.is_file() or destination.stat().st_size != source.stat().st_size:
+                destination.unlink(missing_ok=True)
+                raise RuntimeError(f"Published audio failed verification: {destination}")
+            return destination, "verified_copy", published_at
+        raise FileExistsError(f"No unused delivery name for timestamp {stamp}")
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _toolkit_provenance(script_path: Path) -> tuple[str | None, bool | None]:
@@ -445,8 +530,10 @@ def synthesize_audio(script_path: Path) -> AudioSynthesisResult | None:
             pipeline_path = Path(TTS_SCRIPT).resolve()
             toolkit_revision, toolkit_dirty = _toolkit_provenance(pipeline_path)
             compatibility_patch = Path(__file__).parent / "patches" / "gpu-tts-screening.patch"
+            audio_sha256 = _sha256_file(output)
+            completed_at = datetime.now().astimezone()
             manifest = {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": completed_at.isoformat(),
                 "status": manifest_status,
                 "qc_scope": [
                     "pre_synthesis_text_hazard_patterns",
@@ -456,8 +543,10 @@ def synthesize_audio(script_path: Path) -> AudioSynthesisResult | None:
                 ],
                 "input_path": str(script_path.resolve()),
                 "input_sha256": _sha256_file(script_path),
-                "audio_path": str(output.resolve()),
-                "audio_sha256": _sha256_file(output),
+                "tts_run_dir": str(run_dir.resolve()),
+                "tts_output_dir": str(output.parent.resolve()),
+                "tts_output_filename": output.name,
+                "audio_sha256": audio_sha256,
                 "duration_seconds": duration,
                 "size_bytes": output.stat().st_size,
                 "format": TTS_FORMAT,
@@ -489,17 +578,36 @@ def synthesize_audio(script_path: Path) -> AudioSynthesisResult | None:
                 "python": str(Path(TTS_CONDA_PYTHON).resolve()),
                 "elapsed_seconds": elapsed,
             }
+            # Publish only after every provenance hash above has succeeded.
+            # If the manifest cannot then be persisted, roll back the delivery
+            # entry while retaining the internal audio and report for diagnosis.
+            delivery_path, delivery_method, published_at = _publish_delivery_audio(
+                output,
+                manifest_status,
+                completed_at,
+            )
+            manifest.update(
+                {
+                    "audio_path": str(delivery_path.resolve()),
+                    "published_at": published_at.isoformat(),
+                    "delivery_method": delivery_method,
+                }
+            )
             try:
-                manifest_path.write_text(
-                    json.dumps(manifest, indent=2),
-                    encoding="utf-8",
-                )
-            except OSError as exc:
+                _write_json_atomic(manifest_path, manifest)
+            except Exception as exc:
+                delivery_path.unlink(missing_ok=True)
                 log.error("Could not write TTS manifest: %s", exc)
                 return None
+            try:
+                output.unlink()
+            except OSError as exc:
+                # Delivery is complete and independently addressable. Retaining
+                # the staging name is safe, but should be visible for cleanup.
+                log.warning("Could not remove nested TTS staging audio %s: %s", output, exc)
             log.info(
                 "TTS complete: %s (%.1f MB, %.1fs, QC=%s, elapsed=%.1fs)",
-                output,
+                delivery_path,
                 size_mb,
                 duration,
                 manifest_status.upper(),
@@ -509,11 +617,11 @@ def synthesize_audio(script_path: Path) -> AudioSynthesisResult | None:
             if not approved:
                 log.error(
                     "TTS screening requires review; audio retained at %s and report at %s",
-                    output,
+                    delivery_path,
                     report_path,
                 )
             return AudioSynthesisResult(
-                path=output,
+                path=delivery_path,
                 manifest_path=manifest_path,
                 screening_report_path=report_path,
                 qc_status=manifest_status,
@@ -571,11 +679,12 @@ def save_digest_metadata(
 ):
     """Save metadata about what went into this digest."""
     DIGEST_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    now = datetime.now().astimezone()
+    stamp = now.strftime("%Y%m%d_%H%M%S")
     meta_path = DIGEST_DIR / f"digest_{stamp}.json"
 
     meta = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": now.isoformat(),
         "item_count": len(items),
         "script_path": str(script_path),
         "audio_path": str(audio_result.path) if audio_result else None,

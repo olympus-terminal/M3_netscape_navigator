@@ -62,8 +62,12 @@ TTS_ENABLED = bool(TTS_SCRIPT and Path(TTS_SCRIPT).exists())
 YTDLP_BIN = os.environ.get("YTDLP_BIN", shutil.which("yt-dlp") or "yt-dlp")
 
 # === Output ===
-BASE_DIR = Path(os.environ.get("AGENT_DATA_DIR", Path(__file__).parent))
+PROJECT_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(os.environ.get("AGENT_DATA_DIR", PROJECT_DIR))
 OUTPUT_DIR = BASE_DIR / "output"
+# Finished, user-facing audio belongs at the repository root. The nested
+# output tree is reserved for scripts, reports, manifests, and other internals.
+DELIVERY_DIR = PROJECT_DIR
 DIGEST_DIR = OUTPUT_DIR / "digests"
 AUDIO_DIR = OUTPUT_DIR / "audio"
 SCRIPT_DIR_OUT = OUTPUT_DIR / "scripts"

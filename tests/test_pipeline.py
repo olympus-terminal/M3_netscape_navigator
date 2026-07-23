@@ -1,7 +1,10 @@
 import asyncio
+import errno
 import json
+import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -190,6 +193,7 @@ class TTSTests(unittest.TestCase):
             script = self._write_fake_tts(root, create_audio=True)
             with (
                 patch.object(digest, "AUDIO_DIR", audio_dir),
+                patch.object(digest, "DELIVERY_DIR", root),
                 patch.object(digest, "TTS_CONDA_PYTHON", sys.executable),
                 patch.object(digest, "TTS_SCRIPT", str(script)),
                 patch.object(digest, "TTS_SCRIPT_DIR", str(root)),
@@ -201,10 +205,24 @@ class TTSTests(unittest.TestCase):
                 output = digest.synthesize_audio(input_path)
             self.assertIsNotNone(output)
             self.assertTrue(output.approved)
-            self.assertEqual(output.path.name, "digest_complete.mp3")
+            self.assertEqual(output.path.parent, root)
+            self.assertRegex(
+                output.path.name,
+                r"^ai_research_digest_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}[+-]\d{4}\.mp3$",
+            )
+            self.assertEqual(output.path.stat().st_size, 2048)
             manifest = json.loads(output.manifest_path.read_text())
             self.assertEqual(manifest["voice_resolved"], None)
             self.assertEqual(manifest["screened_audio_chunks"], 1)
+            self.assertEqual(manifest["audio_path"], str(output.path.resolve()))
+            self.assertTrue(Path(manifest["tts_output_dir"]).is_dir())
+            self.assertFalse(
+                (Path(manifest["tts_output_dir"]) / manifest["tts_output_filename"]).exists()
+            )
+            self.assertTrue(output.manifest_path.is_file())
+            self.assertTrue(output.screening_report_path.is_file())
+            self.assertTrue(output.path.is_file())
+            self.assertFalse(output.path.is_symlink())
 
     def test_tts_never_returns_stale_audio(self):
         import sys
@@ -219,6 +237,7 @@ class TTSTests(unittest.TestCase):
             script = self._write_fake_tts(root, create_audio=False)
             with (
                 patch.object(digest, "AUDIO_DIR", audio_dir),
+                patch.object(digest, "DELIVERY_DIR", root),
                 patch.object(digest, "TTS_CONDA_PYTHON", sys.executable),
                 patch.object(digest, "TTS_SCRIPT", str(script)),
                 patch.object(digest, "TTS_SCRIPT_DIR", str(root)),
@@ -240,6 +259,7 @@ class TTSTests(unittest.TestCase):
             script = self._write_fake_tts(root, create_audio=True, complete_qc=False)
             with (
                 patch.object(digest, "AUDIO_DIR", audio_dir),
+                patch.object(digest, "DELIVERY_DIR", root),
                 patch.object(digest, "TTS_CONDA_PYTHON", sys.executable),
                 patch.object(digest, "TTS_SCRIPT", str(script)),
                 patch.object(digest, "TTS_SCRIPT_DIR", str(root)),
@@ -266,6 +286,7 @@ class TTSTests(unittest.TestCase):
             )
             with (
                 patch.object(digest, "AUDIO_DIR", audio_dir),
+                patch.object(digest, "DELIVERY_DIR", root),
                 patch.object(digest, "TTS_CONDA_PYTHON", sys.executable),
                 patch.object(digest, "TTS_SCRIPT", str(script)),
                 patch.object(digest, "TTS_SCRIPT_DIR", str(root)),
@@ -278,7 +299,145 @@ class TTSTests(unittest.TestCase):
             self.assertIsNotNone(output)
             self.assertFalse(output.approved)
             self.assertEqual(output.qc_status, "review_needed")
+            self.assertTrue(output.path.name.endswith("_REVIEW_NEEDED.mp3"))
             self.assertTrue(output.manifest_path.is_file())
+
+    def test_manifest_failure_rolls_back_delivery_and_retains_staging_audio(self):
+        import sys
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio_dir = root / "audio"
+            audio_dir.mkdir()
+            input_path = root / "digest.txt"
+            input_path.write_text("A short test narration.")
+            script = self._write_fake_tts(root, create_audio=True)
+            with (
+                patch.object(digest, "AUDIO_DIR", audio_dir),
+                patch.object(digest, "DELIVERY_DIR", root),
+                patch.object(digest, "TTS_CONDA_PYTHON", sys.executable),
+                patch.object(digest, "TTS_SCRIPT", str(script)),
+                patch.object(digest, "TTS_SCRIPT_DIR", str(root)),
+                patch.object(digest, "TTS_VOICE", "p246"),
+                patch.object(digest, "TTS_FORMAT", "mp3"),
+                patch.object(digest, "TTS_ENABLED", True),
+                patch.object(digest, "_probe_audio_duration", return_value=12.3),
+                patch.object(
+                    digest,
+                    "_write_json_atomic",
+                    side_effect=OSError(errno.ENOSPC, "disk full"),
+                ),
+            ):
+                output = digest.synthesize_audio(input_path)
+
+            self.assertIsNone(output)
+            self.assertEqual(list(root.glob("ai_research_digest_*.mp3")), [])
+            self.assertEqual(len(list(audio_dir.rglob("digest_complete.mp3"))), 1)
+
+    def test_delivery_collision_gets_a_numbered_name_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first_source = root / "first.mp3"
+            second_source = root / "second.mp3"
+            first_source.write_bytes(b"first")
+            second_source.write_bytes(b"second")
+            fixed_time = datetime(
+                2026,
+                7,
+                23,
+                11,
+                30,
+                tzinfo=timezone(timedelta(hours=4)),
+            )
+            with patch.object(digest, "DELIVERY_DIR", root / "delivery"):
+                first, _, _ = digest._publish_delivery_audio(
+                    first_source,
+                    "structural_clean",
+                    fixed_time,
+                )
+                second, _, _ = digest._publish_delivery_audio(
+                    second_source,
+                    "structural_clean",
+                    fixed_time,
+                )
+
+            self.assertEqual(
+                first.name,
+                "ai_research_digest_2026-07-23_11-30-00+0400.mp3",
+            )
+            self.assertEqual(
+                second.name,
+                "ai_research_digest_2026-07-23_11-30-00+0400_02.mp3",
+            )
+            self.assertEqual(first.read_bytes(), b"first")
+            self.assertEqual(second.read_bytes(), b"second")
+            self.assertFalse(first.is_symlink())
+
+    def test_delivery_copy_fallback_is_verified_and_atomic(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp3"
+            source.write_bytes(b"verified audio")
+            real_link = os.link
+            first_link = True
+
+            def cross_device_once(source_path, destination_path):
+                nonlocal first_link
+                if first_link:
+                    first_link = False
+                    raise OSError(errno.EXDEV, "cross-device link")
+                return real_link(source_path, destination_path)
+
+            fixed_time = datetime(
+                2026,
+                7,
+                23,
+                11,
+                30,
+                tzinfo=timezone(timedelta(hours=4)),
+            )
+            delivery_dir = root / "delivery"
+            with (
+                patch.object(digest, "DELIVERY_DIR", delivery_dir),
+                patch.object(digest.os, "link", side_effect=cross_device_once),
+            ):
+                destination, method, _ = digest._publish_delivery_audio(
+                    source,
+                    "structural_clean",
+                    fixed_time,
+                )
+
+            self.assertEqual(method, "verified_copy")
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            self.assertEqual(
+                list(delivery_dir.glob(".ai_research_digest_publish_*.tmp")),
+                [],
+            )
+
+    def test_delivery_copy_failure_leaves_no_partial_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp3"
+            source.write_bytes(b"complete source")
+            delivery_dir = root / "delivery"
+
+            def interrupted_copy(_source, temporary):
+                Path(temporary).write_bytes(b"partial")
+                raise OSError(errno.ENOSPC, "disk full")
+
+            with (
+                patch.object(digest, "DELIVERY_DIR", delivery_dir),
+                patch.object(
+                    digest.os,
+                    "link",
+                    side_effect=OSError(errno.EXDEV, "cross-device link"),
+                ),
+                patch.object(digest.shutil, "copy2", side_effect=interrupted_copy),
+            ):
+                with self.assertRaises(OSError):
+                    digest._publish_delivery_audio(source, "structural_clean")
+
+            self.assertEqual(list(delivery_dir.iterdir()), [])
 
 
 class TTSOutcomeStateTests(unittest.TestCase):
