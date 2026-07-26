@@ -63,6 +63,7 @@ log = logging.getLogger("agent")
 
 _DAILY_INTERVAL = timedelta(days=1)
 _RETRY_INTERVAL = timedelta(hours=1)
+_SCHEDULE_RECHECK_SECONDS = 60.0
 
 
 # ─── State persistence ──────────────────────────────────────────────────────
@@ -117,17 +118,46 @@ def _scheduled_run_from_state(state: dict, now: datetime) -> datetime | None:
     return max(candidates)
 
 
+def _next_run_time(cycle_success: bool, now: datetime, state: dict) -> datetime:
+    """Return the next attempt time without letting cycle duration shift the daily slot."""
+    if now.tzinfo is None:
+        raise ValueError("now must include a timezone")
+    if not cycle_success:
+        return now + _RETRY_INTERVAL
+
+    anchor = _parse_state_time(state.get("last_run"), now.tzinfo) or now
+    next_run_at = anchor + _DAILY_INTERVAL
+    while next_run_at <= now:
+        next_run_at += _DAILY_INTERVAL
+    return next_run_at
+
+
 def _persist_next_run(cycle_success: bool, now: datetime | None = None) -> datetime:
     """Persist and return the next daemon attempt time."""
     now = now or _local_now()
-    if now.tzinfo is None:
-        raise ValueError("now must include a timezone")
-    interval = _DAILY_INTERVAL if cycle_success else _RETRY_INTERVAL
-    next_run_at = now + interval
     state = load_state()
+    next_run_at = _next_run_time(cycle_success, now, state)
     state["next_run_at"] = next_run_at.isoformat()
     save_state(state)
     return next_run_at
+
+
+async def _wait_until(target: datetime, shutdown: asyncio.Event):
+    """Wait for a wall-clock deadline while remaining responsive to suspend and signals."""
+    if target.tzinfo is None:
+        raise ValueError("target must include a timezone")
+
+    while not shutdown.is_set():
+        remaining = (target - _local_now()).total_seconds()
+        if remaining <= 0:
+            return
+        try:
+            await asyncio.wait_for(
+                shutdown.wait(),
+                timeout=min(remaining, _SCHEDULE_RECHECK_SECONDS),
+            )
+        except asyncio.TimeoutError:
+            pass
 
 
 def _record_tts_outcome(state: dict, audio_result) -> bool:
@@ -225,6 +255,7 @@ async def _cancel_judges(judge_tasks: list[asyncio.Task], stop_event: asyncio.Ev
 
 
 async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = False):
+    cycle_started_at = _local_now()
     try:
         await preflight_codex()
     except CodexExecError as exc:
@@ -399,7 +430,7 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
 
     # update state
     state["seen_urls"] = list(seen)
-    state["last_run"] = _local_now().isoformat()
+    state["last_run"] = cycle_started_at.isoformat()
     # Any previously scheduled time belongs to the cycle that just finished.
     # Removing it here makes a restart derive the correct daily/hourly delay
     # from this last_run until daemon_loop persists the new exact schedule.
@@ -439,13 +470,11 @@ async def daemon_loop(verbose: bool = False):
                 scheduled_run.isoformat(timespec="seconds"),
                 remaining / 3600,
             )
-            try:
-                await asyncio.wait_for(shutdown.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                pass
+            await _wait_until(scheduled_run, shutdown)
 
     while not shutdown.is_set():
         cycle_success = False
+        cycle_started_at = _local_now()
         try:
             pending_digest = bool(load_state().get("pending_digest", False))
             if pending_digest:
@@ -461,8 +490,11 @@ async def daemon_loop(verbose: bool = False):
         # Persist the delay before sleeping so a service restart honors the
         # remaining daily/retry interval instead of immediately starting over.
         now = _local_now()
-        interval = _DAILY_INTERVAL if cycle_success else _RETRY_INTERVAL
-        next_run_at = now + interval
+        next_run_at = _next_run_time(
+            cycle_success,
+            now,
+            {"last_run": cycle_started_at.isoformat()},
+        )
         try:
             next_run_at = _persist_next_run(cycle_success, now)
         except Exception:
@@ -476,10 +508,7 @@ async def daemon_loop(verbose: bool = False):
             next_run_at.isoformat(timespec="seconds"),
             remaining / 3600,
         )
-        try:
-            await asyncio.wait_for(shutdown.wait(), timeout=remaining)
-        except asyncio.TimeoutError:
-            pass
+        await _wait_until(next_run_at, shutdown)
 
     log.info("Agent daemon stopped")
 

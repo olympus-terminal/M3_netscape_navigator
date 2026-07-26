@@ -1,6 +1,8 @@
 import asyncio
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import agent
@@ -88,8 +90,94 @@ class DaemonScheduleTests(unittest.TestCase):
             "2026-07-24T11:30:00+04:00",
         )
 
+    def test_successful_cycle_uses_start_time_instead_of_completion_time(self):
+        completed_at = datetime(2026, 7, 23, 11, 30, tzinfo=GST)
+        state = {
+            "last_run": "2026-07-23T10:00:00+04:00",
+            "seen_urls": ["https://example.test/paper"],
+        }
+
+        with (
+            patch.object(agent, "load_state", return_value=state),
+            patch.object(agent, "save_state") as save_state,
+        ):
+            scheduled = agent._persist_next_run(True, completed_at)
+
+        self.assertEqual(scheduled, datetime(2026, 7, 24, 10, 0, tzinfo=GST))
+        self.assertEqual(
+            save_state.call_args.args[0]["next_run_at"],
+            "2026-07-24T10:00:00+04:00",
+        )
+        self.assertEqual(save_state.call_args.args[0]["seen_urls"], state["seen_urls"])
+
+    def test_overlong_success_rolls_forward_to_first_future_daily_slot(self):
+        completed_at = datetime(2026, 7, 25, 10, 0, tzinfo=GST)
+        state = {"last_run": "2026-07-23T10:00:00+04:00"}
+
+        with (
+            patch.object(agent, "load_state", return_value=state),
+            patch.object(agent, "save_state") as save_state,
+        ):
+            scheduled = agent._persist_next_run(True, completed_at)
+
+        self.assertEqual(scheduled, datetime(2026, 7, 26, 10, 0, tzinfo=GST))
+        self.assertEqual(
+            save_state.call_args.args[0]["next_run_at"],
+            "2026-07-26T10:00:00+04:00",
+        )
+
 
 class DaemonRestartTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_cycle_records_its_start_as_schedule_anchor(self):
+        started_at = datetime(2026, 7, 23, 10, 0, tzinfo=GST)
+
+        with tempfile.TemporaryDirectory() as temp:
+            with (
+                patch.object(agent, "_local_now", return_value=started_at),
+                patch.object(agent, "preflight_codex", AsyncMock()),
+                patch.object(agent, "load_state", return_value={"seen_urls": [], "runs": 0}),
+                patch.object(agent, "save_state") as save_state,
+                patch.object(agent, "judge_loop", AsyncMock()),
+                patch.object(
+                    agent,
+                    "_run_crawlers_with_judge_supervision",
+                    AsyncMock(),
+                ),
+                patch.object(agent, "_drain_judges", AsyncMock()),
+                patch.object(agent, "RAW_DIR", Path(temp)),
+            ):
+                cycle_success = await agent.run_cycle(crawl=True, digest=False)
+
+        self.assertTrue(cycle_success)
+        self.assertEqual(
+            save_state.call_args.args[0]["last_run"],
+            "2026-07-23T10:00:00+04:00",
+        )
+
+    async def test_wall_clock_jump_past_deadline_ends_chunked_wait(self):
+        before_suspend = datetime(2026, 7, 23, 11, 0, tzinfo=GST)
+        after_resume = datetime(2026, 7, 23, 13, 0, tzinfo=GST)
+        target = datetime(2026, 7, 23, 12, 0, tzinfo=GST)
+        shutdown = asyncio.Event()
+        observed_timeouts = []
+
+        async def monotonic_timeout(awaitable, timeout):
+            awaitable.close()
+            observed_timeouts.append(timeout)
+            raise asyncio.TimeoutError
+
+        with (
+            patch.object(
+                agent,
+                "_local_now",
+                side_effect=[before_suspend, after_resume],
+            ),
+            patch.object(agent.asyncio, "wait_for", new=monotonic_timeout),
+        ):
+            await agent._wait_until(target, shutdown)
+
+        self.assertEqual(observed_timeouts, [agent._SCHEDULE_RECHECK_SECONDS])
+
     async def test_restart_waits_instead_of_immediately_running_cycle(self):
         now = datetime(2026, 7, 23, 11, 30, tzinfo=GST)
         state = {
