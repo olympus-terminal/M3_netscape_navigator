@@ -1,5 +1,7 @@
 # Codex AI Research Audio Agent
 
+Developed for Minimax M3 or any other local LLM. 
+
 Autonomous agent that crawls current AI research, filters it through isolated
 `codex exec` workers, writes a technical narration script, and optionally turns
 the script into a screened MP3 digest.
