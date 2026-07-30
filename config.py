@@ -143,7 +143,7 @@ SOURCES = {
     "semantic_scholar": {
         "enabled": True,
         "base_url": "https://api.semanticscholar.org/graph/v1",
-        "fields": "title,abstract,url,year,citationCount,openAccessPdf",
+        "fields": "title,abstract,url,year,citationCount,openAccessPdf,authors",
     },
     "lab_blogs": {
         "enabled": True,

@@ -13,6 +13,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote, urlsplit
 
 from codex_backend import CodexExecError, run_codex
 from config import (
@@ -43,6 +44,7 @@ _TTS_PREFLIGHT_CACHE: dict | None = None
 @dataclass(frozen=True)
 class AudioSynthesisResult:
     path: Path
+    notes_path: Path
     manifest_path: Path
     screening_report_path: Path
     qc_status: str
@@ -67,15 +69,31 @@ def _write_json_atomic(path: Path, payload: dict):
         temporary.unlink(missing_ok=True)
 
 
-def _publish_delivery_audio(
-    source: Path,
+def _write_text_atomic(path: Path, content: str):
+    """Replace a text file only after its complete contents are on disk."""
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _publish_delivery_bundle(
+    source_audio: Path,
+    source_notes: Path,
     qc_status: str,
     published_at: datetime | None = None,
-) -> tuple[Path, str, datetime]:
-    """Atomically expose a verified audio artifact at the user-facing top level."""
+) -> tuple[Path, Path, str, datetime]:
+    """Publish verified notes first and their paired audio commit marker last."""
     published_at = published_at or datetime.now().astimezone()
     if published_at.utcoffset() is None:
         raise ValueError("Delivery timestamp must include a UTC offset")
+    if not source_audio.is_file():
+        raise FileNotFoundError(f"Delivery audio is missing: {source_audio}")
+    if not source_notes.is_file():
+        raise FileNotFoundError(f"Source notes are missing: {source_notes}")
+
     stamp = published_at.strftime("%Y-%m-%d_%H-%M-%S%z")
     review_suffix = "_REVIEW_NEEDED" if qc_status == "review_needed" else ""
 
@@ -84,60 +102,80 @@ def _publish_delivery_audio(
     def candidates():
         for sequence in range(1, 100):
             collision_suffix = "" if sequence == 1 else f"_{sequence:02d}"
-            yield DELIVERY_DIR / (
+            audio_path = DELIVERY_DIR / (
                 f"ai_research_digest_{stamp}{collision_suffix}"
-                f"{review_suffix}{source.suffix.lower()}"
+                f"{review_suffix}{source_audio.suffix.lower()}"
             )
+            yield audio_path, audio_path.with_suffix(".md")
 
     unsupported = {errno.EXDEV, errno.EPERM}
     if hasattr(errno, "EOPNOTSUPP"):
         unsupported.add(errno.EOPNOTSUPP)
 
-    # A hard link is instantly visible, cannot replace an existing destination,
-    # and consumes no duplicate disk space. The caller removes the staging name
-    # only after the nested manifest has been persisted.
-    for destination in candidates():
+    staged_audio = DELIVERY_DIR / f".ai_research_digest_publish_{uuid.uuid4().hex}.tmp"
+    staged_notes = DELIVERY_DIR / f".ai_research_digest_sources_{uuid.uuid4().hex}.tmp"
+    delivery_method = "hardlink"
+    try:
+        # Stage both verified artifacts under hidden names before exposing
+        # either. A same-filesystem audio source remains zero-copy.
         try:
-            os.link(source, destination)
-        except FileExistsError:
-            continue
+            os.link(source_audio, staged_audio)
         except OSError as exc:
             if exc.errno not in unsupported:
                 raise
-            break
-        if not destination.is_file() or destination.stat().st_size != source.stat().st_size:
-            destination.unlink(missing_ok=True)
-            raise RuntimeError(f"Published audio failed verification: {destination}")
-        return destination, "hardlink", published_at
-    else:
-        raise FileExistsError(f"No unused delivery name for timestamp {stamp}")
-
-    # Cross-filesystem publication cannot link the source directly. Copy to a
-    # hidden unique file, verify it in full, then hard-link that verified inode
-    # to an unused public name. The public MP3 is therefore never partial and
-    # an interrupted copy cannot leave a misleading delivery file behind.
-    temporary = DELIVERY_DIR / f".ai_research_digest_publish_{uuid.uuid4().hex}.tmp"
-    try:
-        shutil.copy2(source, temporary)
+            shutil.copy2(source_audio, staged_audio)
+            delivery_method = "verified_copy"
         if (
-            not temporary.is_file()
-            or temporary.stat().st_size != source.stat().st_size
-            or _sha256_file(temporary) != _sha256_file(source)
+            not staged_audio.is_file()
+            or staged_audio.stat().st_size != source_audio.stat().st_size
+            or _sha256_file(staged_audio) != _sha256_file(source_audio)
         ):
-            raise RuntimeError(f"Copied audio failed verification: {temporary}")
+            raise RuntimeError(f"Staged audio failed verification: {staged_audio}")
 
-        for destination in candidates():
+        shutil.copy2(source_notes, staged_notes)
+        if (
+            not staged_notes.is_file()
+            or staged_notes.stat().st_size != source_notes.stat().st_size
+            or _sha256_file(staged_notes) != _sha256_file(source_notes)
+        ):
+            raise RuntimeError(f"Staged source notes failed verification: {staged_notes}")
+
+        for audio_path, notes_path in candidates():
+            if audio_path.exists() or notes_path.exists():
+                continue
             try:
-                os.link(temporary, destination)
+                os.link(staged_notes, notes_path)
             except FileExistsError:
                 continue
-            if not destination.is_file() or destination.stat().st_size != source.stat().st_size:
-                destination.unlink(missing_ok=True)
-                raise RuntimeError(f"Published audio failed verification: {destination}")
-            return destination, "verified_copy", published_at
+            try:
+                # The MP3 is linked last and acts as the visible bundle commit.
+                os.link(staged_audio, audio_path)
+            except FileExistsError:
+                notes_path.unlink(missing_ok=True)
+                continue
+            except Exception:
+                notes_path.unlink(missing_ok=True)
+                raise
+
+            try:
+                if (
+                    not audio_path.is_file()
+                    or audio_path.stat().st_size != source_audio.stat().st_size
+                    or not notes_path.is_file()
+                    or notes_path.stat().st_size != source_notes.stat().st_size
+                ):
+                    raise RuntimeError(
+                        f"Published digest bundle failed verification: {audio_path}"
+                    )
+            except Exception:
+                audio_path.unlink(missing_ok=True)
+                notes_path.unlink(missing_ok=True)
+                raise
+            return audio_path, notes_path, delivery_method, published_at
         raise FileExistsError(f"No unused delivery name for timestamp {stamp}")
     finally:
-        temporary.unlink(missing_ok=True)
+        staged_audio.unlink(missing_ok=True)
+        staged_notes.unlink(missing_ok=True)
 
 
 def _toolkit_provenance(script_path: Path) -> tuple[str | None, bool | None]:
@@ -273,6 +311,20 @@ Style guidelines:
 - For paper titles, just say the key idea, not the full formal title
 - End with a brief synthesis: what themes emerged, what directions seem most promising
 
+Attribution guidelines:
+- On the first substantive mention of each paper or study, identify who did the work before
+  describing its contribution or finding
+- When `author_affiliations` explicitly pairs a researcher with a source-provided affiliation,
+  naturally name that researcher and affiliation before stating the contribution or finding
+- When only author names are supplied, identify the first named author by surname followed by
+  "and colleagues"; do not repeatedly fall back to vague phrases like "the authors"
+- Describe the work as coming from a named researcher's group only when the input itself
+  identifies that researcher as the group or lab lead; never infer leadership from author order
+- For a source-backed multi-institution collaboration, name the collaboration or institutions
+  without assigning all of the work to one group
+- Never infer a group leader, affiliation, institution, or location from author order, a name,
+  a URL, or prior knowledge; omit details that the input does not support
+
 The script will be read by a text-to-speech system, so:
 - Write out numbers: "three point five billion" not "3.5B"
 - Spell out ambiguous abbreviations on first use
@@ -363,8 +415,154 @@ def _prepare_batch_payload(items: list[ContentItem]) -> str:
         }
         if item.authors:
             piece["authors"] = item.authors
+        author_affiliations = item.metadata.get("author_affiliations")
+        if isinstance(author_affiliations, list) and author_affiliations:
+            piece["author_affiliations"] = author_affiliations
         pieces.append(piece)
     return json.dumps({"items": pieces}, ensure_ascii=False)
+
+
+def _normalized_inline(value) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())
+
+
+def _markdown_inline(value) -> str:
+    text = _normalized_inline(value)
+    for marker in ("\\", "`", "*", "_", "[", "]", "<", ">", "|"):
+        text = text.replace(marker, f"\\{marker}")
+    return text
+
+
+def _safe_http_url(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if any(
+        ord(character) < 32 or ord(character) == 127 or character in "<>"
+        for character in value
+    ):
+        return None
+    url = value.strip()
+    if not url:
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return None
+    return quote(
+        url,
+        safe=":/?#@!$&'()*+,;=%~.-",
+    )
+
+
+def _source_label(source: str) -> str:
+    labels = {
+        "arxiv": "arXiv",
+        "huggingface_papers": "Hugging Face Daily Papers",
+        "papers_with_code": "Papers With Code / Hugging Face",
+        "semantic_scholar": "Semantic Scholar",
+        "github_trending": "GitHub Trending",
+    }
+    if source.startswith("blog:"):
+        domain = source.removeprefix("blog:")
+        return f"Research blog ({domain})"
+    return labels.get(source, source.replace("_", " "))
+
+
+def _source_backed_author_affiliations(item: ContentItem) -> list[dict[str, str]]:
+    if not isinstance(item.metadata, dict):
+        return []
+    entries = item.metadata.get("author_affiliations")
+    if not isinstance(entries, list):
+        return []
+
+    normalized = []
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        author = _normalized_inline(entry.get("author"))
+        affiliation = _normalized_inline(entry.get("affiliation"))
+        pair = (author, affiliation)
+        if not author or not affiliation or pair in seen:
+            continue
+        seen.add(pair)
+        normalized.append({"author": author, "affiliation": affiliation})
+    return normalized
+
+
+def _render_digest_source_notes(items: list[ContentItem]) -> str:
+    lines = [
+        "# AI Research Digest — Sources",
+        "",
+        f"{len(items)} selected research items.",
+        "",
+        (
+            "Authors and affiliations are reproduced only when supplied by the source. "
+            "The assistant summaries are generated from the collected research metadata."
+        ),
+        "",
+    ]
+
+    for index, item in enumerate(items, 1):
+        title = _markdown_inline(item.title)
+        lines.extend([f"## {index}. {title}", ""])
+
+        authors = _markdown_inline(item.authors)
+        if authors:
+            lines.extend([f"**Source-listed authors:** {authors}", ""])
+
+        affiliations = _source_backed_author_affiliations(item)
+        if affiliations:
+            lines.extend(["**Source-provided affiliations:**", ""])
+            for entry in affiliations:
+                author = _markdown_inline(entry["author"])
+                affiliation = _markdown_inline(entry["affiliation"])
+                lines.append(f"- {author} — {affiliation}")
+            lines.append("")
+
+        source = _markdown_inline(_source_label(item.source))
+        if source:
+            lines.extend([f"**Collected via:** {source}", ""])
+
+        published = _markdown_inline(item.published)
+        if published:
+            lines.extend([f"**Published:** {published}", ""])
+
+        scores = []
+        for label, score in (
+            ("Technical depth", item.technical_depth),
+            ("Novelty", item.novelty),
+            ("Relevance", item.relevance),
+        ):
+            if type(score) is int:
+                scores.append(f"{label} {score}/10")
+        if scores:
+            lines.extend([f"**Selection scores:** {' · '.join(scores)}", ""])
+
+        summary = _markdown_inline(item.summary)
+        if summary:
+            lines.extend([f"**Assistant summary:** {summary}", ""])
+
+        source_url = _safe_http_url(item.url)
+        if source_url:
+            lines.extend([f"**Original source:** [Open source](<{source_url}>)", ""])
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_digest_source_notes(
+    items: list[ContentItem],
+    notes_path: Path,
+) -> Path:
+    """Write deterministic, source-backed Markdown beside a narration script."""
+    notes_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_text_atomic(notes_path, _render_digest_source_notes(items))
+    log.info("Digest source notes written: %s", notes_path)
+    return notes_path
 
 
 async def compose_digest_script(items: list[ContentItem]) -> Path | None:
@@ -428,10 +626,16 @@ async def compose_digest_script(items: list[ContentItem]) -> Path | None:
     return script_path
 
 
-def synthesize_audio(script_path: Path) -> AudioSynthesisResult | None:
+def synthesize_audio(
+    script_path: Path,
+    source_notes_path: Path,
+) -> AudioSynthesisResult | None:
     """Run the screened GPU toolkit pipeline and verify its new audio output."""
     if not TTS_ENABLED:
         log.info("TTS not configured — skipping audio synthesis. Script saved as text.")
+        return None
+    if not source_notes_path.is_file():
+        log.error("Digest source notes are missing: %s", source_notes_path)
         return None
 
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
@@ -581,14 +785,22 @@ def synthesize_audio(script_path: Path) -> AudioSynthesisResult | None:
             # Publish only after every provenance hash above has succeeded.
             # If the manifest cannot then be persisted, roll back the delivery
             # entry while retaining the internal audio and report for diagnosis.
-            delivery_path, delivery_method, published_at = _publish_delivery_audio(
+            (
+                delivery_path,
+                delivery_notes_path,
+                delivery_method,
+                published_at,
+            ) = _publish_delivery_bundle(
                 output,
+                source_notes_path,
                 manifest_status,
                 completed_at,
             )
             manifest.update(
                 {
                     "audio_path": str(delivery_path.resolve()),
+                    "source_notes_path": str(delivery_notes_path.resolve()),
+                    "source_notes_sha256": _sha256_file(delivery_notes_path),
                     "published_at": published_at.isoformat(),
                     "delivery_method": delivery_method,
                 }
@@ -597,6 +809,7 @@ def synthesize_audio(script_path: Path) -> AudioSynthesisResult | None:
                 _write_json_atomic(manifest_path, manifest)
             except Exception as exc:
                 delivery_path.unlink(missing_ok=True)
+                delivery_notes_path.unlink(missing_ok=True)
                 log.error("Could not write TTS manifest: %s", exc)
                 return None
             try:
@@ -606,8 +819,10 @@ def synthesize_audio(script_path: Path) -> AudioSynthesisResult | None:
                 # the staging name is safe, but should be visible for cleanup.
                 log.warning("Could not remove nested TTS staging audio %s: %s", output, exc)
             log.info(
-                "TTS complete: %s (%.1f MB, %.1fs, QC=%s, elapsed=%.1fs)",
+                "TTS complete: %s with sources %s "
+                "(%.1f MB, %.1fs, QC=%s, elapsed=%.1fs)",
                 delivery_path,
+                delivery_notes_path,
                 size_mb,
                 duration,
                 manifest_status.upper(),
@@ -616,12 +831,15 @@ def synthesize_audio(script_path: Path) -> AudioSynthesisResult | None:
             approved = status == "CLEAN"
             if not approved:
                 log.error(
-                    "TTS screening requires review; audio retained at %s and report at %s",
+                    "TTS screening requires review; audio retained at %s, "
+                    "sources at %s, and report at %s",
                     delivery_path,
+                    delivery_notes_path,
                     report_path,
                 )
             return AudioSynthesisResult(
                 path=delivery_path,
+                notes_path=delivery_notes_path,
                 manifest_path=manifest_path,
                 screening_report_path=report_path,
                 qc_status=manifest_status,
@@ -675,6 +893,7 @@ def _probe_audio_duration(audio_path: Path) -> float | None:
 def save_digest_metadata(
     items: list[ContentItem],
     script_path: Path,
+    source_notes_path: Path,
     audio_result: AudioSynthesisResult | None,
 ):
     """Save metadata about what went into this digest."""
@@ -682,11 +901,18 @@ def save_digest_metadata(
     now = datetime.now().astimezone()
     stamp = now.strftime("%Y%m%d_%H%M%S")
     meta_path = DIGEST_DIR / f"digest_{stamp}.json"
+    published_notes_path = (
+        audio_result.notes_path if audio_result is not None else source_notes_path
+    )
+    if not published_notes_path.is_file():
+        raise FileNotFoundError(f"Digest source notes are missing: {published_notes_path}")
 
     meta = {
         "timestamp": now.isoformat(),
         "item_count": len(items),
         "script_path": str(script_path),
+        "source_notes_path": str(published_notes_path.resolve()),
+        "source_notes_sha256": _sha256_file(published_notes_path),
         "audio_path": str(audio_result.path) if audio_result else None,
         "tts_manifest_path": str(audio_result.manifest_path) if audio_result else None,
         "tts_screening_report_path": (
@@ -699,6 +925,9 @@ def save_digest_metadata(
                 "title": item.title,
                 "url": item.url,
                 "source": item.source,
+                "authors": item.authors,
+                "published": item.published,
+                "author_affiliations": _source_backed_author_affiliations(item),
                 "scores": {
                     "technical_depth": item.technical_depth,
                     "novelty": item.novelty,
@@ -710,5 +939,5 @@ def save_digest_metadata(
         ],
     }
 
-    meta_path.write_text(json.dumps(meta, indent=2))
+    _write_json_atomic(meta_path, meta)
     log.info(f"Digest metadata saved: {meta_path}")

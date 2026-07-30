@@ -1,9 +1,12 @@
 import asyncio
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, call, patch
 
 import agent
 
@@ -224,6 +227,452 @@ class DaemonRestartTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(daemon_task, timeout=1)
 
         run_cycle.assert_not_awaited()
+
+
+class StartupInstallerTests(unittest.TestCase):
+    @staticmethod
+    def _make_executable(path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+
+    def test_service_preserves_lexical_venv_path_and_escapes_systemd_specifiers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project_dir = root / "moved repo %i"
+            project_dir.mkdir()
+            (project_dir / "agent.py").write_text("# agent\n", encoding="utf-8")
+
+            real_python = root / "runtime" / "python3"
+            self._make_executable(real_python)
+            venv_python = project_dir / ".venv" / "bin" / "python"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.symlink_to(real_python)
+
+            unit = agent._render_startup_unit(project_dir, venv_python)
+
+        escaped_project = (
+            str(project_dir.absolute()).replace(" ", r"\x20").replace("%", "%%")
+        )
+        exec_project = str(project_dir.absolute()).replace("%", "%%")
+        escaped_python = str(venv_python.absolute()).replace("%", "%%")
+        self.assertIn(f"WorkingDirectory={escaped_project}", unit)
+        self.assertIn(
+            f'ExecStart="{escaped_python}" "{exec_project}/agent.py" --daemon',
+            unit,
+        )
+        self.assertNotIn(str(real_python.absolute()), unit)
+        self.assertIn("Restart=always", unit)
+        self.assertIn("WantedBy=default.target", unit)
+
+    def test_desktop_fallback_applies_both_string_and_exec_escaping_layers(self):
+        systemctl_path = Path(
+            '/opt/system ctl $cash\\slash"quote%percent/bin/systemctl'
+        )
+
+        desktop = agent._render_desktop_autostart(systemctl_path)
+        exec_line = next(
+            line for line in desktop.splitlines() if line.startswith("Exec=")
+        )
+
+        self.assertIn(r"\\$cash", exec_line)
+        self.assertIn(r"\\\\slash", exec_line)
+        self.assertIn(r'\\"quote', exec_line)
+        self.assertIn("quote%%percent", exec_line)
+
+    def test_install_writes_startup_files_and_runs_checked_argv_commands(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project_dir = root / "repo"
+            project_dir.mkdir()
+            (project_dir / "agent.py").write_text("# agent\n", encoding="utf-8")
+            python_path = project_dir / ".venv" / "bin" / "python"
+            systemctl_path = root / "bin" / "systemctl"
+            systemd_analyze_path = root / "bin" / "systemd-analyze"
+            self._make_executable(python_path)
+            self._make_executable(systemctl_path)
+            self._make_executable(systemd_analyze_path)
+            config_home = root / "config"
+
+            with patch.object(agent.subprocess, "run") as run:
+                service_path, desktop_path, changed = agent.install_startup_service(
+                    project_dir=project_dir,
+                    python_executable=python_path,
+                    config_home=config_home,
+                    systemctl_path=systemctl_path,
+                    systemd_analyze_path=systemd_analyze_path,
+                )
+
+            self.assertTrue(changed)
+            self.assertEqual(
+                service_path,
+                config_home / "systemd" / "user" / "ai-research-agent.service",
+            )
+            self.assertEqual(
+                desktop_path,
+                config_home / "autostart" / "ai-research-agent.desktop",
+            )
+            self.assertIn(str(project_dir), service_path.read_text(encoding="utf-8"))
+            self.assertIn(str(python_path), service_path.read_text(encoding="utf-8"))
+            desktop = desktop_path.read_text(encoding="utf-8")
+            self.assertIn("Exec=/bin/sh -c", desktop)
+            self.assertIn(
+                f"{systemctl_path} --user daemon-reload",
+                desktop,
+            )
+            self.assertIn(
+                f"{systemctl_path} --user start ai-research-agent.service",
+                desktop,
+            )
+            self.assertEqual(service_path.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(desktop_path.stat().st_mode & 0o777, 0o644)
+            self.assertGreater(agent._SYSTEMCTL_TIMEOUT_SECONDS, 120)
+            expected = [
+                call(
+                    [
+                        str(systemd_analyze_path),
+                        "--user",
+                        "verify",
+                        ANY,
+                    ],
+                    check=True,
+                    timeout=agent._SYSTEMCTL_TIMEOUT_SECONDS,
+                ),
+                call(
+                    [str(systemctl_path), "--user", "daemon-reload"],
+                    check=True,
+                    timeout=agent._SYSTEMCTL_TIMEOUT_SECONDS,
+                ),
+                call(
+                    [
+                        str(systemctl_path),
+                        "--user",
+                        "enable",
+                        "ai-research-agent.service",
+                    ],
+                    check=True,
+                    timeout=agent._SYSTEMCTL_TIMEOUT_SECONDS,
+                ),
+                call(
+                    [
+                        str(systemctl_path),
+                        "--user",
+                        "restart",
+                        "ai-research-agent.service",
+                    ],
+                    check=True,
+                    timeout=agent._SYSTEMCTL_TIMEOUT_SECONDS,
+                ),
+                call(
+                    [
+                        str(systemctl_path),
+                        "--user",
+                        "is-enabled",
+                        "--quiet",
+                        "ai-research-agent.service",
+                    ],
+                    check=True,
+                    timeout=agent._SYSTEMCTL_TIMEOUT_SECONDS,
+                ),
+                call(
+                    [
+                        str(systemctl_path),
+                        "--user",
+                        "is-active",
+                        "--quiet",
+                        "ai-research-agent.service",
+                    ],
+                    check=True,
+                    timeout=agent._SYSTEMCTL_TIMEOUT_SECONDS,
+                ),
+            ]
+            self.assertEqual(run.call_args_list, expected)
+
+    def test_second_install_is_idempotent_and_does_not_restart_unchanged_service(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project_dir = root / "repo"
+            project_dir.mkdir()
+            (project_dir / "agent.py").write_text("# agent\n", encoding="utf-8")
+            python_path = project_dir / ".venv" / "bin" / "python"
+            systemctl_path = root / "bin" / "systemctl"
+            systemd_analyze_path = root / "bin" / "systemd-analyze"
+            self._make_executable(python_path)
+            self._make_executable(systemctl_path)
+            self._make_executable(systemd_analyze_path)
+            config_home = root / "config"
+
+            with patch.object(agent.subprocess, "run"):
+                service_path, desktop_path, _ = agent.install_startup_service(
+                    project_dir=project_dir,
+                    python_executable=python_path,
+                    config_home=config_home,
+                    systemctl_path=systemctl_path,
+                    systemd_analyze_path=systemd_analyze_path,
+                )
+            original_service = service_path.read_bytes()
+            original_desktop = desktop_path.read_bytes()
+
+            with (
+                patch.object(agent.os, "replace") as replace,
+                patch.object(agent.subprocess, "run") as run,
+            ):
+                _, _, changed = agent.install_startup_service(
+                    project_dir=project_dir,
+                    python_executable=python_path,
+                    config_home=config_home,
+                    systemctl_path=systemctl_path,
+                    systemd_analyze_path=systemd_analyze_path,
+                )
+
+            self.assertFalse(changed)
+            replace.assert_not_called()
+            self.assertEqual(service_path.read_bytes(), original_service)
+            self.assertEqual(desktop_path.read_bytes(), original_desktop)
+            self.assertIn(
+                call(
+                    [str(systemctl_path), "--user", "daemon-reload"],
+                    check=True,
+                    timeout=agent._SYSTEMCTL_TIMEOUT_SECONDS,
+                ),
+                run.call_args_list,
+            )
+            self.assertIn(
+                call(
+                    [
+                        str(systemctl_path),
+                        "--user",
+                        "start",
+                        "ai-research-agent.service",
+                    ],
+                    check=True,
+                    timeout=agent._SYSTEMCTL_TIMEOUT_SECONDS,
+                ),
+                run.call_args_list,
+            )
+
+    def test_atomic_write_failure_preserves_existing_startup_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "service"
+            destination.write_text("old config\n", encoding="utf-8")
+
+            with patch.object(
+                agent.os,
+                "replace",
+                side_effect=OSError("disk full"),
+            ):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    agent._write_text_if_changed_atomic(
+                        destination,
+                        "new config\n",
+                    )
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), "old config\n")
+            self.assertEqual(
+                [path for path in destination.parent.iterdir() if path != destination],
+                [],
+            )
+
+    def test_unchanged_group_writable_startup_file_is_republished_as_0644(self):
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "service"
+            destination.write_text("same config\n", encoding="utf-8")
+            destination.chmod(0o664)
+
+            changed = agent._write_text_if_changed_atomic(
+                destination,
+                "same config\n",
+            )
+
+            self.assertTrue(changed)
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o644)
+
+    def test_reinstall_after_move_replaces_old_repo_and_venv_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            systemctl_path = root / "bin" / "systemctl"
+            systemd_analyze_path = root / "bin" / "systemd-analyze"
+            self._make_executable(systemctl_path)
+            self._make_executable(systemd_analyze_path)
+            config_home = root / "config"
+
+            projects = []
+            for name in ("old repo", "new repo"):
+                project_dir = root / name
+                project_dir.mkdir()
+                (project_dir / "agent.py").write_text("# agent\n", encoding="utf-8")
+                python_path = project_dir / ".venv" / "bin" / "python"
+                self._make_executable(python_path)
+                projects.append((project_dir, python_path))
+
+            with patch.object(agent.subprocess, "run"):
+                service_path, _, _ = agent.install_startup_service(
+                    project_dir=projects[0][0],
+                    python_executable=projects[0][1],
+                    config_home=config_home,
+                    systemctl_path=systemctl_path,
+                    systemd_analyze_path=systemd_analyze_path,
+                )
+
+            with patch.object(agent.subprocess, "run") as run:
+                _, _, changed = agent.install_startup_service(
+                    project_dir=projects[1][0],
+                    python_executable=projects[1][1],
+                    config_home=config_home,
+                    systemctl_path=systemctl_path,
+                    systemd_analyze_path=systemd_analyze_path,
+                )
+
+            unit = service_path.read_text(encoding="utf-8")
+            self.assertTrue(changed)
+            self.assertNotIn(str(projects[0][0]), unit)
+            self.assertNotIn(str(projects[0][1]), unit)
+            self.assertIn(str(projects[1][0]), unit)
+            self.assertIn(str(projects[1][1]), unit)
+            self.assertIn(
+                call(
+                    [
+                        str(systemctl_path),
+                        "--user",
+                        "restart",
+                        "ai-research-agent.service",
+                    ],
+                    check=True,
+                    timeout=agent._SYSTEMCTL_TIMEOUT_SECONDS,
+                ),
+                run.call_args_list,
+            )
+
+    def test_missing_interpreter_fails_before_writing_startup_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project_dir = root / "repo"
+            project_dir.mkdir()
+            (project_dir / "agent.py").write_text("# agent\n", encoding="utf-8")
+            systemctl_path = root / "systemctl"
+            self._make_executable(systemctl_path)
+            config_home = root / "config"
+
+            with patch.object(agent.subprocess, "run") as run:
+                with self.assertRaisesRegex(FileNotFoundError, "Python interpreter"):
+                    agent.install_startup_service(
+                        project_dir=project_dir,
+                        python_executable=project_dir / ".venv" / "bin" / "python",
+                        config_home=config_home,
+                        systemctl_path=systemctl_path,
+                    )
+
+            self.assertFalse(config_home.exists())
+            run.assert_not_called()
+
+    def test_relative_xdg_config_home_is_ignored(self):
+        with (
+            patch.dict(os.environ, {"XDG_CONFIG_HOME": "relative/config"}),
+            patch.object(Path, "home", return_value=Path("/safe/home")),
+        ):
+            config_home = agent._startup_config_home()
+
+        self.assertEqual(config_home, Path("/safe/home/.config"))
+
+    def test_unit_validation_failure_preserves_existing_startup_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project_dir = root / "repo"
+            project_dir.mkdir()
+            (project_dir / "agent.py").write_text("# agent\n", encoding="utf-8")
+            python_path = project_dir / "python"
+            systemctl_path = root / "systemctl"
+            systemd_analyze_path = root / "systemd-analyze"
+            self._make_executable(python_path)
+            self._make_executable(systemctl_path)
+            self._make_executable(systemd_analyze_path)
+            config_home = root / "config"
+            service_path = (
+                config_home / "systemd" / "user" / "ai-research-agent.service"
+            )
+            desktop_path = (
+                config_home / "autostart" / "ai-research-agent.desktop"
+            )
+            service_path.parent.mkdir(parents=True)
+            desktop_path.parent.mkdir(parents=True)
+            service_path.write_text("known-good service\n", encoding="utf-8")
+            desktop_path.write_text("known-good desktop\n", encoding="utf-8")
+
+            validation_error = subprocess.CalledProcessError(
+                1,
+                "systemd-analyze",
+            )
+            with patch.object(
+                agent.subprocess,
+                "run",
+                side_effect=validation_error,
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    agent.install_startup_service(
+                        project_dir=project_dir,
+                        python_executable=python_path,
+                        config_home=config_home,
+                        systemctl_path=systemctl_path,
+                        systemd_analyze_path=systemd_analyze_path,
+                    )
+
+            self.assertEqual(
+                service_path.read_text(encoding="utf-8"),
+                "known-good service\n",
+            )
+            self.assertEqual(
+                desktop_path.read_text(encoding="utf-8"),
+                "known-good desktop\n",
+            )
+
+    def test_systemctl_failure_is_not_swallowed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project_dir = root / "repo"
+            project_dir.mkdir()
+            (project_dir / "agent.py").write_text("# agent\n", encoding="utf-8")
+            python_path = project_dir / "python"
+            systemctl_path = root / "systemctl"
+            systemd_analyze_path = root / "systemd-analyze"
+            self._make_executable(python_path)
+            self._make_executable(systemctl_path)
+            self._make_executable(systemd_analyze_path)
+
+            with patch.object(
+                agent.subprocess,
+                "run",
+                side_effect=[
+                    None,
+                    subprocess.CalledProcessError(1, "systemctl"),
+                ],
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    agent.install_startup_service(
+                        project_dir=project_dir,
+                        python_executable=python_path,
+                        config_home=root / "config",
+                        systemctl_path=systemctl_path,
+                        systemd_analyze_path=systemd_analyze_path,
+                    )
+
+    def test_install_service_cli_short_circuits_the_research_pipeline(self):
+        installed = (
+            Path("/config/systemd/user/ai-research-agent.service"),
+            Path("/config/autostart/ai-research-agent.desktop"),
+            False,
+        )
+        with (
+            patch.object(sys, "argv", ["agent.py", "--install-service"]),
+            patch.object(agent, "install_startup_service", return_value=installed) as install,
+            patch.object(agent, "setup_logging") as setup_logging,
+            patch.object(agent.asyncio, "run") as run_async,
+            patch("builtins.print"),
+        ):
+            agent.main()
+
+        install.assert_called_once_with()
+        setup_logging.assert_not_called()
+        run_async.assert_not_called()
 
 
 if __name__ == "__main__":

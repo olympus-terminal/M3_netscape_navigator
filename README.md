@@ -127,14 +127,34 @@ acceptable.
 .venv/bin/python agent.py --daemon
 ```
 
+## Automatic startup
+
+Install or refresh the per-user startup service from the current checkout:
+
+```bash
+.venv/bin/python agent.py --install-service
+```
+
+The command records the current repository and virtual-environment paths,
+enables and starts the service, and installs a desktop-session fallback for an
+encrypted home directory. The service starts again with the user session after
+a reboot and restarts after an unexpected process failure. If the repository
+is moved or the virtual environment is recreated elsewhere, rerun the same
+command from the new location; no separate deployment copy is needed.
+
 ## Output
 
 Finished audio is placed directly in the repository root with a local-time
-timestamp and UTC offset:
+timestamp and UTC offset. A same-named Markdown file accompanies every audio
+artifact with the covered studies, clickable original sources, source-listed
+authors, any source-provided affiliations, selection scores, and assistant
+summaries:
 
 ```text
 ai_research_digest_2026-07-23_11-30-00+0400.mp3
+ai_research_digest_2026-07-23_11-30-00+0400.md
 ai_research_digest_2026-07-23_11-30-00+0400_REVIEW_NEEDED.mp3
+ai_research_digest_2026-07-23_11-30-00+0400_REVIEW_NEEDED.md
 ```
 
 Files carrying `REVIEW_NEEDED` are complete and structurally verified, but have
@@ -146,7 +166,7 @@ remains under `output/`:
 ```text
 output/
 ├── raw/        # Accepted items, scores, summaries, and judge provenance
-├── scripts/    # Plain-text narration scripts
+├── scripts/    # Plain-text narration scripts and internal Markdown source notes
 ├── audio/      # TTS working files, QC reports, and manifests
 └── digests/    # Per-digest metadata
 ```

@@ -14,6 +14,7 @@ Architecture:
 Usage:
   python agent.py                # run one crawl+judge+digest cycle
   python agent.py --daemon       # run continuously, one cycle per day
+  python agent.py --install-service  # install/update automatic user startup
   python agent.py --crawl-only   # crawl and judge, skip TTS
   python agent.py --digest-only  # compose and synthesize from last judged set
 """
@@ -22,8 +23,13 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import shlex
+import shutil
 import signal
+import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -40,7 +46,13 @@ from config import (
     WORDS_PER_MINUTE,
 )
 from crawlers import run_all_crawlers
-from digest import compose_digest_script, preflight_tts, save_digest_metadata, synthesize_audio
+from digest import (
+    compose_digest_script,
+    preflight_tts,
+    save_digest_metadata,
+    synthesize_audio,
+    write_digest_source_notes,
+)
 from judge import judge_loop
 from queue_manager import ContentQueue
 
@@ -64,6 +76,244 @@ log = logging.getLogger("agent")
 _DAILY_INTERVAL = timedelta(days=1)
 _RETRY_INTERVAL = timedelta(hours=1)
 _SCHEDULE_RECHECK_SECONDS = 60.0
+
+
+# ─── Startup installation ───────────────────────────────────────────────────
+
+_SERVICE_NAME = "ai-research-agent.service"
+_DESKTOP_AUTOSTART_NAME = "ai-research-agent.desktop"
+_SYSTEMCTL_TIMEOUT_SECONDS = 180
+
+
+def _absolute_lexical_path(path: str | Path) -> Path:
+    """Return an absolute path without resolving virtualenv symlinks."""
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def _startup_config_home(config_home: str | Path | None = None) -> Path:
+    if config_home is not None:
+        return _absolute_lexical_path(config_home)
+    configured_home = os.environ.get("XDG_CONFIG_HOME")
+    if configured_home and Path(configured_home).is_absolute():
+        return _absolute_lexical_path(configured_home)
+    return _absolute_lexical_path(Path.home() / ".config")
+
+
+def _systemd_quote(value: str | Path, *, exec_argument: bool = False) -> str:
+    """Quote one literal path for a systemd unit without shell semantics."""
+    text = os.fspath(value)
+    if any(character in text for character in ("\0", "\n", "\r")):
+        raise ValueError("systemd paths cannot contain NUL or line breaks")
+    text = text.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    if exec_argument:
+        text = text.replace("$", "$$")
+    return f'"{text}"'
+
+
+def _systemd_path_value(value: str | Path) -> str:
+    """Encode a literal absolute path for path-only systemd settings."""
+    text = os.fspath(value)
+    if any(character in text for character in ("\0", "\n", "\r")):
+        raise ValueError("systemd paths cannot contain NUL or line breaks")
+
+    encoded = []
+    for character in text:
+        if character == "\\":
+            encoded.append("\\\\")
+        elif character == "%":
+            encoded.append("%%")
+        elif character == " ":
+            encoded.append("\\x20")
+        elif character == "\t":
+            encoded.append("\\t")
+        elif character == '"':
+            encoded.append("\\x22")
+        elif character == "'":
+            encoded.append("\\x27")
+        else:
+            encoded.append(character)
+    return "".join(encoded)
+
+
+def _desktop_quoted_argument(value: str) -> str:
+    """Encode one quoted Exec argument through both desktop escaping layers."""
+    text = value
+    if any(character in text for character in ("\0", "\n", "\r")):
+        raise ValueError("desktop Exec arguments cannot contain NUL or line breaks")
+    exec_escaped = (
+        text.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("`", "\\`")
+        .replace("$", "\\$")
+    )
+    escaped = exec_escaped.replace("\\", "\\\\").replace("%", "%%")
+    return f'"{escaped}"'
+
+
+def _render_startup_unit(
+    project_dir: str | Path,
+    python_executable: str | Path,
+) -> str:
+    project_path = _absolute_lexical_path(project_dir)
+    python_path = _absolute_lexical_path(python_executable)
+    agent_path = project_path / "agent.py"
+    return (
+        "[Unit]\n"
+        "Description=Daily Codex AI research audio agent\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "StartLimitIntervalSec=0\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"WorkingDirectory={_systemd_path_value(project_path)}\n"
+        f"ExecStart={_systemd_quote(python_path, exec_argument=True)} "
+        f"{_systemd_quote(agent_path, exec_argument=True)} --daemon\n"
+        "Environment=PYTHONUNBUFFERED=1\n"
+        "Restart=always\n"
+        "RestartSec=300\n"
+        "KillSignal=SIGTERM\n"
+        "KillMode=mixed\n"
+        "TimeoutStopSec=120\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def _render_desktop_autostart(systemctl_path: str | Path) -> str:
+    executable = shlex.quote(str(_absolute_lexical_path(systemctl_path)))
+    command = (
+        f"{executable} --user daemon-reload && "
+        f"{executable} --user start {_SERVICE_NAME}"
+    )
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=AI Research Agent\n"
+        "Comment=Start the daily research digest after the encrypted home is unlocked\n"
+        f"Exec=/bin/sh -c {_desktop_quoted_argument(command)}\n"
+        "Terminal=false\n"
+        "X-GNOME-Autostart-enabled=true\n"
+    )
+
+
+def _write_text_if_changed_atomic(path: Path, content: str) -> bool:
+    """Atomically publish UTF-8 text with mode 0644; return whether it changed."""
+    try:
+        content_matches = path.read_text(encoding="utf-8") == content
+        mode_is_safe = (
+            not path.is_symlink() and (path.stat().st_mode & 0o777) == 0o644
+        )
+        if content_matches and mode_is_safe:
+            return False
+    except FileNotFoundError:
+        pass
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.chmod(0o644)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    return True
+
+
+def _required_executable(name: str, supplied_path: str | Path | None) -> Path:
+    discovered = (
+        os.fspath(supplied_path) if supplied_path is not None else shutil.which(name)
+    )
+    if discovered is None:
+        raise FileNotFoundError(f"{name} was not found on PATH")
+    executable = _absolute_lexical_path(discovered)
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise FileNotFoundError(f"{name} is not executable: {executable}")
+    return executable
+
+
+def _validate_startup_unit(unit_content: str, systemd_analyze: Path):
+    """Ask the installed systemd parser to validate a staged unit."""
+    with tempfile.TemporaryDirectory(prefix="ai_research_agent_unit_") as temp:
+        staged_unit = Path(temp) / _SERVICE_NAME
+        staged_unit.write_text(unit_content, encoding="utf-8")
+        staged_unit.chmod(0o644)
+        subprocess.run(
+            [str(systemd_analyze), "--user", "verify", str(staged_unit)],
+            check=True,
+            timeout=_SYSTEMCTL_TIMEOUT_SECONDS,
+        )
+
+
+def install_startup_service(
+    *,
+    project_dir: str | Path | None = None,
+    python_executable: str | Path | None = None,
+    config_home: str | Path | None = None,
+    systemctl_path: str | Path | None = None,
+    systemd_analyze_path: str | Path | None = None,
+) -> tuple[Path, Path, bool]:
+    """Install or refresh the user service and encrypted-home login fallback."""
+    project_path = _absolute_lexical_path(
+        project_dir if project_dir is not None else Path(__file__).resolve().parent
+    )
+    python_path = _absolute_lexical_path(
+        python_executable if python_executable is not None else sys.executable
+    )
+    agent_path = project_path / "agent.py"
+    if not agent_path.is_file():
+        raise FileNotFoundError(f"Agent entry point not found: {agent_path}")
+    if not python_path.is_file():
+        raise FileNotFoundError(f"Python interpreter not found: {python_path}")
+    if not os.access(python_path, os.X_OK):
+        raise PermissionError(f"Python interpreter is not executable: {python_path}")
+
+    systemctl = _required_executable("systemctl", systemctl_path)
+    systemd_analyze = _required_executable("systemd-analyze", systemd_analyze_path)
+
+    config_root = _startup_config_home(config_home)
+
+    service_path = config_root / "systemd" / "user" / _SERVICE_NAME
+    desktop_path = config_root / "autostart" / _DESKTOP_AUTOSTART_NAME
+    unit_content = _render_startup_unit(project_path, python_path)
+    desktop_content = _render_desktop_autostart(systemctl)
+    _validate_startup_unit(unit_content, systemd_analyze)
+
+    # Publish the fallback first. The service unit is the primary startup
+    # contract and is written last so a fallback-write failure cannot replace it.
+    desktop_changed = _write_text_if_changed_atomic(
+        desktop_path,
+        desktop_content,
+    )
+    service_changed = _write_text_if_changed_atomic(
+        service_path,
+        unit_content,
+    )
+
+    def systemctl_run(*arguments: str):
+        subprocess.run(
+            [str(systemctl), "--user", *arguments],
+            check=True,
+            timeout=_SYSTEMCTL_TIMEOUT_SECONDS,
+        )
+
+    systemctl_run("daemon-reload")
+    systemctl_run("enable", _SERVICE_NAME)
+    systemctl_run("restart" if service_changed else "start", _SERVICE_NAME)
+    systemctl_run("is-enabled", "--quiet", _SERVICE_NAME)
+    systemctl_run("is-active", "--quiet", _SERVICE_NAME)
+
+    return service_path, desktop_path, service_changed or desktop_changed
 
 
 # ─── State persistence ──────────────────────────────────────────────────────
@@ -177,6 +427,7 @@ def _record_tts_outcome(state: dict, audio_result) -> bool:
             "recorded_at": _local_now().isoformat(),
             "qc_status": audio_result.qc_status,
             "audio": str(audio_result.path.resolve()),
+            "sources": str(audio_result.notes_path.resolve()),
             "manifest": str(audio_result.manifest_path.resolve()),
             "screening_report": str(audio_result.screening_report_path.resolve()),
         }
@@ -331,6 +582,7 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
                     "source": item.source,
                     "type": item.content_type.value,
                     "authors": item.authors,
+                    "published": item.published,
                     "scores": {
                         "technical_depth": item.technical_depth,
                         "novelty": item.novelty,
@@ -341,6 +593,7 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
                     "reason": item.judge_reason,
                     "judge_attempts": item.judge_attempts,
                     "abstract": item.abstract,
+                    "metadata": item.metadata,
                 }
                 for item in kept_items
             ],
@@ -368,6 +621,8 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
                 raw_text="",
                 abstract=d.get("abstract", ""),
                 authors=d.get("authors", ""),
+                published=d.get("published", ""),
+                metadata=d.get("metadata", {}),
             )
             scores = d.get("scores", {})
             item.technical_depth = scores.get("technical_depth")
@@ -395,31 +650,56 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
 
         script_path = await compose_digest_script(kept_items)
         if script_path:
+            source_notes_path = write_digest_source_notes(
+                kept_items,
+                script_path.with_suffix(".md"),
+            )
             log.info("Starting TTS synthesis (this will take a while)...")
-            audio_result = synthesize_audio(script_path)
-            save_digest_metadata(kept_items, script_path, audio_result)
+            audio_result = synthesize_audio(script_path, source_notes_path)
+            try:
+                save_digest_metadata(
+                    kept_items,
+                    script_path,
+                    source_notes_path,
+                    audio_result,
+                )
+            except Exception:
+                # A completed audio/notes bundle is the delivery commit. Keep it
+                # and advance state even if secondary JSON metadata cannot be
+                # recorded, avoiding an expensive duplicate retry.
+                log.error("Could not save digest metadata", exc_info=True)
 
             if TTS_ENABLED:
                 cycle_success = _record_tts_outcome(state, audio_result)
                 if audio_result and audio_result.approved:
-                    log.info("=== DIGEST READY: %s ===", audio_result.path)
+                    log.info(
+                        "=== DIGEST READY: %s (sources: %s) ===",
+                        audio_result.path,
+                        audio_result.notes_path,
+                    )
                 elif audio_result:
                     log.error(
-                        "TTS needs review (%s). Audio=%s manifest=%s. "
+                        "TTS needs review (%s). Audio=%s sources=%s manifest=%s. "
                         "Artifact preserved without automatic regeneration.",
                         audio_result.qc_status,
                         audio_result.path,
+                        audio_result.notes_path,
                         audio_result.manifest_path,
                     )
                 else:
                     log.error(
-                        "TTS failed QC. Script saved for digest-only retry: %s",
+                        "TTS failed QC. Script and sources saved for digest-only retry: %s, %s",
                         script_path,
+                        source_notes_path,
                     )
             else:
                 state["pending_digest"] = False
                 state.pop("pending_review", None)
-                log.info("TTS is disabled. Script ready at: %s", script_path)
+                log.info(
+                    "TTS is disabled. Script and sources ready at: %s, %s",
+                    script_path,
+                    source_notes_path,
+                )
         else:
             log.error("Failed to compose digest script")
             cycle_success = False
@@ -519,11 +799,25 @@ def main():
     parser = argparse.ArgumentParser(
         description="AI Research Agent — crawl, judge, narrate bleeding-edge AI research"
     )
-    parser.add_argument("--daemon", action="store_true", help="Run continuously (one cycle/day)")
-    parser.add_argument("--crawl-only", action="store_true", help="Crawl and judge, skip TTS")
-    parser.add_argument("--digest-only", action="store_true", help="Compose + TTS from last judged set")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--daemon", action="store_true", help="Run continuously (one cycle/day)")
+    mode.add_argument("--crawl-only", action="store_true", help="Crawl and judge, skip TTS")
+    mode.add_argument("--digest-only", action="store_true", help="Compose + TTS from last judged set")
+    mode.add_argument(
+        "--install-service",
+        action="store_true",
+        help="Install/update automatic startup for the current repository and Python",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
     args = parser.parse_args()
+
+    if args.install_service:
+        service_path, desktop_path, changed = install_startup_service()
+        status = "updated" if changed else "already current"
+        print(f"Startup service {status}: {service_path}")
+        print(f"Encrypted-home login fallback: {desktop_path}")
+        print("The agent is enabled and running.")
+        return
 
     setup_logging(args.verbose)
 

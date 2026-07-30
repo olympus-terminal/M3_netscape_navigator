@@ -7,4 +7,6 @@ agent.log
 .env
 /ai_research_digest_*.mp3
 /ai_research_digest_*.wav
+/ai_research_digest_*.md
 /.ai_research_digest_publish_*.tmp
+/.ai_research_digest_sources_*.tmp

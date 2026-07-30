@@ -4,12 +4,14 @@ import json
 import os
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import agent
+import crawlers
 import digest
 import judge
 from queue_manager import ContentItem, ContentQueue, ContentType
@@ -125,6 +127,31 @@ class JudgeContractTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WriterTests(unittest.IsolatedAsyncioTestCase):
+    def test_writer_requires_source_backed_research_attribution(self):
+        instruction = digest.SCRIPT_WRITER_INSTRUCTION
+        self.assertIn("first substantive mention", instruction)
+        self.assertIn("and colleagues", instruction)
+        self.assertIn("source-provided affiliation", instruction)
+        self.assertIn("Never infer", instruction)
+
+    def test_writer_payload_includes_source_backed_author_affiliations(self):
+        research = item()
+        research.authors = "Alex Rivera, Sam Lee"
+        research.metadata["author_affiliations"] = [
+            {
+                "author": "Alex Rivera",
+                "affiliation": "Example Research Institute",
+            }
+        ]
+
+        payload = json.loads(digest._prepare_batch_payload([research]))
+
+        self.assertEqual(payload["items"][0]["authors"], research.authors)
+        self.assertEqual(
+            payload["items"][0]["author_affiliations"],
+            research.metadata["author_affiliations"],
+        )
+
     async def test_writer_preserves_multiline_unicode(self):
         prose = "First paragraph.\n\nSecond paragraph about α and β."
         response = json.dumps({"covered_item_indices": [1], "segment": prose})
@@ -152,7 +179,186 @@ class WriterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(output)
 
 
+class AttributionMetadataTests(unittest.TestCase):
+    def test_arxiv_author_metadata_preserves_source_affiliation_pairing(self):
+        entry = ET.fromstring(
+            """
+            <entry xmlns="http://www.w3.org/2005/Atom"
+                   xmlns:arxiv="http://arxiv.org/schemas/atom">
+              <author>
+                <name>Alex Rivera</name>
+                <arxiv:affiliation>Example Research Institute</arxiv:affiliation>
+              </author>
+              <author><name>Sam Lee</name></author>
+            </entry>
+            """
+        )
+
+        authors, author_affiliations = crawlers._arxiv_author_metadata(entry)
+
+        self.assertEqual(authors, "Alex Rivera, Sam Lee")
+        self.assertEqual(
+            author_affiliations,
+            [
+                {
+                    "author": "Alex Rivera",
+                    "affiliation": "Example Research Institute",
+                }
+            ],
+        )
+
+    def test_semantic_scholar_author_names_ignore_malformed_entries(self):
+        authors = crawlers._semantic_scholar_author_names(
+            [
+                {"authorId": "1", "name": "Alex Rivera"},
+                None,
+                {"authorId": "2"},
+                {"authorId": "3", "name": "  Sam Lee  "},
+            ]
+        )
+
+        self.assertEqual(authors, "Alex Rivera, Sam Lee")
+
+
+class SourceNotesTests(unittest.TestCase):
+    def test_source_notes_render_source_backed_items_safely_in_order(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            notes_path = root / "digest.md"
+
+            first = item(1)
+            first.title = "Method [alpha]\n# not a heading"
+            first.url = "https://example.test/paper?q=source notes"
+            first.source = "arxiv"
+            first.authors = "Alex_Rivera, Sam Lee"
+            first.published = "2026-07-27"
+            first.technical_depth = 8
+            first.novelty = 7
+            first.relevance = 9
+            first.summary = "Uses <source evidence> while preserving α and β."
+            first.metadata["author_affiliations"] = [
+                {
+                    "author": "Alex_Rivera",
+                    "affiliation": "Example [Research] Institute",
+                },
+                {"author": "Incomplete entry"},
+                "not a mapping",
+            ]
+
+            second = item(2)
+            second.title = "Second study"
+            second.url = "javascript:alert('not a source')"
+            second.authors = ""
+            second.technical_depth = 7
+            second.novelty = 6
+            second.relevance = 8
+            second.summary = "A second assistant-generated summary."
+
+            self.assertEqual(
+                digest.write_digest_source_notes([first, second], notes_path),
+                notes_path,
+            )
+            notes = notes_path.read_text(encoding="utf-8")
+            self.assertLess(notes.index("Method"), notes.index("Second study"))
+            self.assertNotIn("\n# not a heading", notes)
+            self.assertIn("Alex\\_Rivera", notes)
+            self.assertIn("Example \\[Research\\] Institute", notes)
+            self.assertNotIn("Incomplete entry", notes)
+            self.assertIn("https://example.test/paper?q=source%20notes", notes)
+            self.assertNotIn("javascript:", notes)
+            self.assertEqual(notes.count("Original source:"), 1)
+            self.assertIn("Assistant summary:", notes)
+            self.assertIn("α and β", notes)
+            self.assertNotIn("Unknown", notes)
+            self.assertNotIn("N/A", notes)
+            self.assertIsNone(digest._safe_http_url("http://[broken"))
+
+    def test_digest_metadata_records_published_source_notes_and_authors(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            digest_dir = root / "digests"
+            script_path = root / "digest.txt"
+            script_path.write_text("Narration.", encoding="utf-8")
+            internal_notes_path = root / "digest.md"
+            internal_notes_path.write_text("# Sources\n", encoding="utf-8")
+            public_notes_path = (
+                root
+                / "ai_research_digest_2026-07-27_14-23-56+0400_02_REVIEW_NEEDED.md"
+            )
+            public_notes_path.write_text("# Sources\n", encoding="utf-8")
+            audio_result = SimpleNamespace(
+                path=public_notes_path.with_suffix(".mp3"),
+                notes_path=public_notes_path,
+                manifest_path=root / "tts_manifest.json",
+                screening_report_path=root / "hallucination_report.json",
+                qc_status="review_needed",
+                approved=False,
+            )
+
+            research = item(1)
+            research.authors = "Alex Rivera, Sam Lee"
+            research.published = "2026-07-27"
+            research.metadata["author_affiliations"] = [
+                {
+                    "author": "Alex Rivera",
+                    "affiliation": "Example Research Institute",
+                },
+                {"author": "Incomplete entry"},
+            ]
+
+            with patch.object(digest, "DIGEST_DIR", digest_dir):
+                digest.save_digest_metadata(
+                    [research],
+                    script_path,
+                    internal_notes_path,
+                    audio_result,
+                )
+
+            [meta_path] = list(digest_dir.glob("digest_*.json"))
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                metadata["source_notes_path"],
+                str(public_notes_path.resolve()),
+            )
+            self.assertEqual(
+                metadata["source_notes_sha256"],
+                digest._sha256_file(public_notes_path),
+            )
+            self.assertEqual(metadata["items"][0]["authors"], research.authors)
+            self.assertEqual(metadata["items"][0]["published"], research.published)
+            self.assertEqual(
+                metadata["items"][0]["author_affiliations"],
+                [
+                    {
+                        "author": "Alex Rivera",
+                        "affiliation": "Example Research Institute",
+                    }
+                ],
+            )
+
+    def test_atomic_text_failure_leaves_no_partial_notes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            destination = root / "sources.md"
+
+            with patch.object(
+                digest.os,
+                "replace",
+                side_effect=OSError(errno.ENOSPC, "disk full"),
+            ):
+                with self.assertRaises(OSError):
+                    digest._write_text_atomic(destination, "complete notes")
+
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(root.iterdir()), [])
+
+
 class TTSTests(unittest.TestCase):
+    def _write_notes(self, input_path: Path) -> Path:
+        notes_path = input_path.with_suffix(".md")
+        notes_path.write_text("# AI Research Digest Sources\n", encoding="utf-8")
+        return notes_path
+
     def _write_fake_tts(
         self,
         root: Path,
@@ -190,6 +396,7 @@ class TTSTests(unittest.TestCase):
             audio_dir.mkdir()
             input_path = root / "digest.txt"
             input_path.write_text("A short test narration.")
+            notes_path = self._write_notes(input_path)
             script = self._write_fake_tts(root, create_audio=True)
             with (
                 patch.object(digest, "AUDIO_DIR", audio_dir),
@@ -202,7 +409,7 @@ class TTSTests(unittest.TestCase):
                 patch.object(digest, "TTS_ENABLED", True),
                 patch.object(digest, "_probe_audio_duration", return_value=12.3),
             ):
-                output = digest.synthesize_audio(input_path)
+                output = digest.synthesize_audio(input_path, notes_path)
             self.assertIsNotNone(output)
             self.assertTrue(output.approved)
             self.assertEqual(output.path.parent, root)
@@ -215,6 +422,11 @@ class TTSTests(unittest.TestCase):
             self.assertEqual(manifest["voice_resolved"], None)
             self.assertEqual(manifest["screened_audio_chunks"], 1)
             self.assertEqual(manifest["audio_path"], str(output.path.resolve()))
+            self.assertEqual(manifest["source_notes_path"], str(output.notes_path.resolve()))
+            self.assertEqual(
+                manifest["source_notes_sha256"],
+                digest._sha256_file(output.notes_path),
+            )
             self.assertTrue(Path(manifest["tts_output_dir"]).is_dir())
             self.assertFalse(
                 (Path(manifest["tts_output_dir"]) / manifest["tts_output_filename"]).exists()
@@ -222,6 +434,12 @@ class TTSTests(unittest.TestCase):
             self.assertTrue(output.manifest_path.is_file())
             self.assertTrue(output.screening_report_path.is_file())
             self.assertTrue(output.path.is_file())
+            self.assertTrue(output.notes_path.is_file())
+            self.assertEqual(output.path.stem, output.notes_path.stem)
+            self.assertEqual(
+                output.notes_path.read_text(encoding="utf-8"),
+                notes_path.read_text(encoding="utf-8"),
+            )
             self.assertFalse(output.path.is_symlink())
 
     def test_tts_never_returns_stale_audio(self):
@@ -234,6 +452,7 @@ class TTSTests(unittest.TestCase):
             (audio_dir / "old.mp3").write_bytes(b'x' * 2048)
             input_path = root / "digest.txt"
             input_path.write_text("A short test narration.")
+            notes_path = self._write_notes(input_path)
             script = self._write_fake_tts(root, create_audio=False)
             with (
                 patch.object(digest, "AUDIO_DIR", audio_dir),
@@ -245,7 +464,8 @@ class TTSTests(unittest.TestCase):
                 patch.object(digest, "TTS_FORMAT", "mp3"),
                 patch.object(digest, "TTS_ENABLED", True),
             ):
-                self.assertIsNone(digest.synthesize_audio(input_path))
+                self.assertIsNone(digest.synthesize_audio(input_path, notes_path))
+            self.assertEqual(list(root.glob("ai_research_digest_*.*")), [])
 
     def test_tts_rejects_incomplete_chunk_screening(self):
         import sys
@@ -256,6 +476,7 @@ class TTSTests(unittest.TestCase):
             audio_dir.mkdir()
             input_path = root / "digest.txt"
             input_path.write_text("A short test narration.")
+            notes_path = self._write_notes(input_path)
             script = self._write_fake_tts(root, create_audio=True, complete_qc=False)
             with (
                 patch.object(digest, "AUDIO_DIR", audio_dir),
@@ -268,7 +489,8 @@ class TTSTests(unittest.TestCase):
                 patch.object(digest, "TTS_ENABLED", True),
                 patch.object(digest, "_probe_audio_duration", return_value=12.3),
             ):
-                self.assertIsNone(digest.synthesize_audio(input_path))
+                self.assertIsNone(digest.synthesize_audio(input_path, notes_path))
+            self.assertEqual(list(root.glob("ai_research_digest_*.*")), [])
 
     def test_tts_retains_review_artifact_with_status(self):
         import sys
@@ -279,6 +501,7 @@ class TTSTests(unittest.TestCase):
             audio_dir.mkdir()
             input_path = root / "digest.txt"
             input_path.write_text("A short test narration.")
+            notes_path = self._write_notes(input_path)
             script = self._write_fake_tts(
                 root,
                 create_audio=True,
@@ -295,11 +518,13 @@ class TTSTests(unittest.TestCase):
                 patch.object(digest, "TTS_ENABLED", True),
                 patch.object(digest, "_probe_audio_duration", return_value=12.3),
             ):
-                output = digest.synthesize_audio(input_path)
+                output = digest.synthesize_audio(input_path, notes_path)
             self.assertIsNotNone(output)
             self.assertFalse(output.approved)
             self.assertEqual(output.qc_status, "review_needed")
             self.assertTrue(output.path.name.endswith("_REVIEW_NEEDED.mp3"))
+            self.assertTrue(output.notes_path.name.endswith("_REVIEW_NEEDED.md"))
+            self.assertEqual(output.path.stem, output.notes_path.stem)
             self.assertTrue(output.manifest_path.is_file())
 
     def test_manifest_failure_rolls_back_delivery_and_retains_staging_audio(self):
@@ -311,6 +536,7 @@ class TTSTests(unittest.TestCase):
             audio_dir.mkdir()
             input_path = root / "digest.txt"
             input_path.write_text("A short test narration.")
+            notes_path = self._write_notes(input_path)
             script = self._write_fake_tts(root, create_audio=True)
             with (
                 patch.object(digest, "AUDIO_DIR", audio_dir),
@@ -328,10 +554,11 @@ class TTSTests(unittest.TestCase):
                     side_effect=OSError(errno.ENOSPC, "disk full"),
                 ),
             ):
-                output = digest.synthesize_audio(input_path)
+                output = digest.synthesize_audio(input_path, notes_path)
 
             self.assertIsNone(output)
             self.assertEqual(list(root.glob("ai_research_digest_*.mp3")), [])
+            self.assertEqual(list(root.glob("ai_research_digest_*.md")), [])
             self.assertEqual(len(list(audio_dir.rglob("digest_complete.mp3"))), 1)
 
     def test_delivery_collision_gets_a_numbered_name_without_overwrite(self):
@@ -339,8 +566,12 @@ class TTSTests(unittest.TestCase):
             root = Path(temp)
             first_source = root / "first.mp3"
             second_source = root / "second.mp3"
+            first_notes = root / "first.md"
+            second_notes = root / "second.md"
             first_source.write_bytes(b"first")
             second_source.write_bytes(b"second")
+            first_notes.write_text("first sources", encoding="utf-8")
+            second_notes.write_text("second sources", encoding="utf-8")
             fixed_time = datetime(
                 2026,
                 7,
@@ -350,13 +581,15 @@ class TTSTests(unittest.TestCase):
                 tzinfo=timezone(timedelta(hours=4)),
             )
             with patch.object(digest, "DELIVERY_DIR", root / "delivery"):
-                first, _, _ = digest._publish_delivery_audio(
+                first, first_public_notes, _, _ = digest._publish_delivery_bundle(
                     first_source,
+                    first_notes,
                     "structural_clean",
                     fixed_time,
                 )
-                second, _, _ = digest._publish_delivery_audio(
+                second, second_public_notes, _, _ = digest._publish_delivery_bundle(
                     second_source,
+                    second_notes,
                     "structural_clean",
                     fixed_time,
                 )
@@ -369,15 +602,53 @@ class TTSTests(unittest.TestCase):
                 second.name,
                 "ai_research_digest_2026-07-23_11-30-00+0400_02.mp3",
             )
+            self.assertEqual(first.stem, first_public_notes.stem)
+            self.assertEqual(second.stem, second_public_notes.stem)
             self.assertEqual(first.read_bytes(), b"first")
             self.assertEqual(second.read_bytes(), b"second")
+            self.assertEqual(first_public_notes.read_text(), "first sources")
+            self.assertEqual(second_public_notes.read_text(), "second sources")
             self.assertFalse(first.is_symlink())
+
+    def test_orphan_notes_force_the_bundle_to_use_the_next_collision_stem(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp3"
+            notes = root / "source.md"
+            source.write_bytes(b"audio")
+            notes.write_text("sources", encoding="utf-8")
+            delivery_dir = root / "delivery"
+            delivery_dir.mkdir()
+            fixed_time = datetime(
+                2026,
+                7,
+                23,
+                11,
+                30,
+                tzinfo=timezone(timedelta(hours=4)),
+            )
+            orphan = delivery_dir / "ai_research_digest_2026-07-23_11-30-00+0400.md"
+            orphan.write_text("older notes", encoding="utf-8")
+
+            with patch.object(digest, "DELIVERY_DIR", delivery_dir):
+                audio_path, notes_path, _, _ = digest._publish_delivery_bundle(
+                    source,
+                    notes,
+                    "structural_clean",
+                    fixed_time,
+                )
+
+            self.assertTrue(audio_path.name.endswith("_02.mp3"))
+            self.assertTrue(notes_path.name.endswith("_02.md"))
+            self.assertEqual(orphan.read_text(), "older notes")
 
     def test_delivery_copy_fallback_is_verified_and_atomic(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source = root / "source.mp3"
+            notes = root / "source.md"
             source.write_bytes(b"verified audio")
+            notes.write_text("verified sources", encoding="utf-8")
             real_link = os.link
             first_link = True
 
@@ -401,16 +672,23 @@ class TTSTests(unittest.TestCase):
                 patch.object(digest, "DELIVERY_DIR", delivery_dir),
                 patch.object(digest.os, "link", side_effect=cross_device_once),
             ):
-                destination, method, _ = digest._publish_delivery_audio(
+                destination, public_notes, method, _ = digest._publish_delivery_bundle(
                     source,
+                    notes,
                     "structural_clean",
                     fixed_time,
                 )
 
             self.assertEqual(method, "verified_copy")
             self.assertEqual(destination.read_bytes(), source.read_bytes())
+            self.assertEqual(public_notes.read_text(), notes.read_text())
+            self.assertEqual(destination.stem, public_notes.stem)
             self.assertEqual(
                 list(delivery_dir.glob(".ai_research_digest_publish_*.tmp")),
+                [],
+            )
+            self.assertEqual(
+                list(delivery_dir.glob(".ai_research_digest_sources_*.tmp")),
                 [],
             )
 
@@ -418,7 +696,9 @@ class TTSTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source = root / "source.mp3"
+            notes = root / "source.md"
             source.write_bytes(b"complete source")
+            notes.write_text("complete sources", encoding="utf-8")
             delivery_dir = root / "delivery"
 
             def interrupted_copy(_source, temporary):
@@ -435,9 +715,46 @@ class TTSTests(unittest.TestCase):
                 patch.object(digest.shutil, "copy2", side_effect=interrupted_copy),
             ):
                 with self.assertRaises(OSError):
-                    digest._publish_delivery_audio(source, "structural_clean")
+                    digest._publish_delivery_bundle(
+                        source,
+                        notes,
+                        "structural_clean",
+                    )
 
             self.assertEqual(list(delivery_dir.iterdir()), [])
+
+    def test_audio_commit_failure_rolls_back_public_notes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp3"
+            notes = root / "source.md"
+            source.write_bytes(b"complete source")
+            notes.write_text("complete sources", encoding="utf-8")
+            delivery_dir = root / "delivery"
+            real_link = os.link
+            link_calls = 0
+
+            def fail_audio_commit(source_path, destination_path):
+                nonlocal link_calls
+                link_calls += 1
+                if link_calls == 3:
+                    raise OSError(errno.ENOSPC, "disk full")
+                return real_link(source_path, destination_path)
+
+            with (
+                patch.object(digest, "DELIVERY_DIR", delivery_dir),
+                patch.object(digest.os, "link", side_effect=fail_audio_commit),
+            ):
+                with self.assertRaises(OSError):
+                    digest._publish_delivery_bundle(
+                        source,
+                        notes,
+                        "structural_clean",
+                    )
+
+            self.assertEqual(list(delivery_dir.iterdir()), [])
+            self.assertEqual(source.read_bytes(), b"complete source")
+            self.assertEqual(notes.read_text(), "complete sources")
 
 
 class TTSOutcomeStateTests(unittest.TestCase):
@@ -446,6 +763,7 @@ class TTSOutcomeStateTests(unittest.TestCase):
             approved=approved,
             qc_status="structural_clean" if approved else "review_needed",
             path=root / "digest.mp3",
+            notes_path=root / "digest.md",
             manifest_path=root / "tts_manifest.json",
             screening_report_path=root / "hallucination_report.json",
         )
@@ -461,6 +779,7 @@ class TTSOutcomeStateTests(unittest.TestCase):
         self.assertTrue(cycle_success)
         self.assertFalse(state["pending_digest"])
         self.assertEqual(state["pending_review"]["qc_status"], "review_needed")
+        self.assertTrue(state["pending_review"]["sources"].endswith("digest.md"))
 
     def test_missing_audio_is_retried(self):
         state = {"pending_digest": False}

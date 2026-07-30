@@ -23,6 +23,11 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 
+_ARXIV_NAMESPACES = {
+    "a": "http://www.w3.org/2005/Atom",
+    "arxiv": "http://arxiv.org/schemas/atom",
+}
+
 
 async def _delay_for_domain(domain: str):
     lo, hi = DOMAIN_DELAYS.get(domain, DOMAIN_DELAYS["default"])
@@ -61,6 +66,44 @@ def _strip_html(html: str) -> str:
     return text
 
 
+def _arxiv_author_metadata(entry: ET.Element) -> tuple[str, list[dict[str, str]]]:
+    """Return author names and any author-affiliation pairs supplied by arXiv."""
+    names = []
+    author_affiliations = []
+    for author in entry.findall("a:author", _ARXIV_NAMESPACES):
+        name_element = author.find("a:name", _ARXIV_NAMESPACES)
+        if name_element is None or not name_element.text:
+            continue
+        name = re.sub(r"\s+", " ", name_element.text).strip()
+        if not name:
+            continue
+        names.append(name)
+
+        affiliation_element = author.find("arxiv:affiliation", _ARXIV_NAMESPACES)
+        if affiliation_element is None or not affiliation_element.text:
+            continue
+        affiliation = re.sub(r"\s+", " ", affiliation_element.text).strip()
+        if affiliation:
+            author_affiliations.append(
+                {"author": name, "affiliation": affiliation}
+            )
+    return ", ".join(names), author_affiliations
+
+
+def _semantic_scholar_author_names(author_records) -> str:
+    """Join the author names returned inline by Semantic Scholar paper search."""
+    if not isinstance(author_records, list):
+        return ""
+    names = []
+    for author in author_records:
+        if not isinstance(author, dict):
+            continue
+        name = author.get("name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return ", ".join(names)
+
+
 # ─── arxiv ───────────────────────────────────────────────────────────────────
 
 async def crawl_arxiv(queue: ContentQueue, seen: set, session: aiohttp.ClientSession):
@@ -83,7 +126,7 @@ async def crawl_arxiv(queue: ContentQueue, seen: set, session: aiohttp.ClientSes
             continue
 
         root = ET.fromstring(xml_text)
-        ns = {"a": "http://www.w3.org/2005/Atom"}
+        ns = _ARXIV_NAMESPACES
 
         for entry in root.findall("a:entry", ns):
             if count >= MAX_PAGES_PER_SOURCE_PER_RUN:
@@ -94,10 +137,11 @@ async def crawl_arxiv(queue: ContentQueue, seen: set, session: aiohttp.ClientSes
 
             title = entry.find("a:title", ns).text.strip().replace("\n", " ")
             abstract = entry.find("a:summary", ns).text.strip().replace("\n", " ")
-            authors = ", ".join(
-                a.find("a:name", ns).text for a in entry.findall("a:author", ns)
-            )
+            authors, author_affiliations = _arxiv_author_metadata(entry)
             published = entry.find("a:published", ns).text[:10]
+            metadata = {"category": cat}
+            if author_affiliations:
+                metadata["author_affiliations"] = author_affiliations
 
             seen.add(paper_id)
             await queue.submit(ContentItem(
@@ -109,7 +153,7 @@ async def crawl_arxiv(queue: ContentQueue, seen: set, session: aiohttp.ClientSes
                 abstract=abstract,
                 authors=authors,
                 published=published,
-                metadata={"category": cat},
+                metadata=metadata,
             ))
             count += 1
 
@@ -406,6 +450,7 @@ async def crawl_semantic_scholar(queue: ContentQueue, seen: set, session: aiohtt
                 content_type=ContentType.PAPER,
                 raw_text=abstract,
                 abstract=abstract,
+                authors=_semantic_scholar_author_names(paper.get("authors")),
                 metadata={
                     "citations": paper.get("citationCount", 0),
                     "has_pdf": bool(paper.get("openAccessPdf")),
