@@ -58,6 +58,9 @@ else:
 
 class CodexBackendTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        backend = patch.object(codex_backend, "LLM_BACKEND", "codex")
+        backend.start()
+        self.addCleanup(backend.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.fake_bin = self.root / "fake-codex"

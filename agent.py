@@ -33,7 +33,7 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from codex_backend import CodexExecError, preflight_codex
+from codex_backend import CodexExecError, preflight_codex, backend_identity
 from config import (
     BASE_DIR,
     CODEX_JUDGE_WORKERS,
@@ -510,14 +510,14 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
     try:
         await preflight_codex()
     except CodexExecError as exc:
-        raise RuntimeError(f"Codex preflight failed: {exc}") from exc
+        raise RuntimeError(f"Language-model preflight failed: {exc}") from exc
     if digest and TTS_ENABLED:
         try:
             tts_runtime = await asyncio.to_thread(preflight_tts)
             log.info(
-                "TTS preflight passed: Coqui %s, Torch %s, CUDA=%s, voice=%s",
-                tts_runtime.get("tts"),
-                tts_runtime.get("torch"),
+                "TTS preflight passed: engine=%s, Torch=%s, CUDA=%s, voice=%s",
+                tts_runtime.get("engine", "coqui"),
+                tts_runtime.get("torch", tts_runtime.get("versions", {}).get("torch")),
                 tts_runtime.get("cuda_available"),
                 tts_runtime.get("voice"),
             )
@@ -592,6 +592,7 @@ async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = Fal
                     "key_contributions": item.key_contributions,
                     "reason": item.judge_reason,
                     "judge_attempts": item.judge_attempts,
+                    "judge_model": item.metadata.get("judge_model", backend_identity()),
                     "abstract": item.abstract,
                     "metadata": item.metadata,
                 }

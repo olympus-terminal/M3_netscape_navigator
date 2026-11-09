@@ -50,13 +50,31 @@ CODEX_MAX_JUDGE_ATTEMPTS = _env_positive_int("CODEX_MAX_JUDGE_ATTEMPTS", 2)
 CODEX_MAX_WRITER_ATTEMPTS = _env_positive_int("CODEX_MAX_WRITER_ATTEMPTS", 2)
 CODEX_RETRY_DELAY_SECONDS = _env_positive_float("CODEX_RETRY_DELAY_SECONDS", 5)
 
+# Local/OpenAI-compatible models use a recording proxy; Codex remains opt-in
+# through the original default. Never silently switch providers on a failure.
+LLM_BACKEND = os.environ.get("LLM_BACKEND", "codex").strip()
+if LLM_BACKEND not in {"codex", "openai_compatible"}:
+    raise ValueError("LLM_BACKEND must be codex or openai_compatible")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:18101/v1").rstrip("/")
+LLM_MODEL = os.environ.get("LLM_MODEL", "").strip()
+LLM_DEPLOYMENT = os.environ.get("LLM_DEPLOYMENT", "").strip()
+LLM_MAX_TOKENS = _env_positive_int("LLM_MAX_TOKENS", 16384)
+LLM_ENABLE_THINKING = _env_bool("LLM_ENABLE_THINKING", False)
+
 # === TTS (optional — omit to skip audio synthesis) ===
+TTS_BACKEND = os.environ.get("TTS_BACKEND", "local_coqui")
+if TTS_BACKEND not in {"local_coqui", "spark_qwen3"}:
+    raise ValueError("TTS_BACKEND must be local_coqui or spark_qwen3")
+SPARK_TTS_HOST = os.environ.get("SPARK_TTS_HOST", "")
+SPARK_TTS_ROOT = os.environ.get("SPARK_TTS_ROOT", "")
+SPARK_TTS_PYTHON = os.environ.get("SPARK_TTS_PYTHON", "")
+SPARK_TTS_VOICE = os.environ.get("SPARK_TTS_VOICE", "zv")
 TTS_CONDA_PYTHON = os.environ.get("TTS_PYTHON", shutil.which("python3") or "python3")
 TTS_SCRIPT = os.environ.get("TTS_SCRIPT", "")
 TTS_SCRIPT_DIR = str(Path(TTS_SCRIPT).parent) if TTS_SCRIPT else ""
 TTS_VOICE = os.environ.get("TTS_VOICE", "p246")
 TTS_FORMAT = os.environ.get("TTS_FORMAT", "mp3")
-TTS_ENABLED = bool(TTS_SCRIPT and Path(TTS_SCRIPT).exists())
+TTS_ENABLED = TTS_BACKEND == "spark_qwen3" or bool(TTS_SCRIPT and Path(TTS_SCRIPT).exists())
 
 # === yt-dlp (optional) ===
 YTDLP_BIN = os.environ.get("YTDLP_BIN", shutil.which("yt-dlp") or "yt-dlp")

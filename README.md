@@ -1,18 +1,16 @@
-# Codex AI Research Audio Agent
-
-Developed for Minimax M3 or any other local LLM. 
+# AI Research Audio Agent
 
 Autonomous agent that crawls current AI research, filters it through isolated
-`codex exec` workers, writes a technical narration script, and optionally turns
+`codex exec` workers or a local model API, writes a technical narration script, and optionally turns
 the script into a screened MP3 digest.
 
-The two Codex roles are deliberately narrow:
+The two language-model roles are deliberately narrow:
 
 ```text
-[Crawlers] ──async──▶ [Queue] ──batches──▶ [Codex Judge]
+[Crawlers] ──async──▶ [Queue] ──batches──▶ [Judge]
                                            │
                                            ▼
-                                   [Codex Script Writer]
+                                   [Script Writer]
                                            │
                                            ▼
                               [Screened Coqui TTS, p246]
@@ -85,6 +83,23 @@ uses local Coqui rather than submitting an unverified cluster job.
 
 ## Configuration
 
+Judging and writing can also use an OpenAI-compatible model through a recording
+proxy. Set `LLM_BACKEND=openai_compatible`, `LLM_BASE_URL` to the proxy's `/v1`
+URL, and `LLM_MODEL` to its exact advertised model ID. The client uses tool-free
+chat completions with JSON schemas and checks the returned model, completion
+status, and the existing judge/writer contracts. It rejects truncated responses
+and tool calls. Endpoint failure follows the existing bounded retry policy;
+it never silently falls back to a cloud model.
+
+For MiMo Flash MXFP4 on a two-GPU llama.cpp server, start with one server slot,
+32,768 context tokens, one judge worker, batches of six, and a 1,800-second judge
+timeout. `LLM_MAX_TOKENS` defaults to 16,384 and `LLM_ENABLE_THINKING` to false.
+Set `LLM_DEPLOYMENT` to distinguish serving stacks and quantizations in digest
+metadata. The recording proxy retains requests, responses, and token usage;
+each digest also records the configured language-model identity. Codex remains
+available with `LLM_BACKEND=codex`. These settings do not change speech synthesis
+or the user's global Codex configuration.
+
 Important environment settings:
 
 | Setting | Default | Purpose |
@@ -102,6 +117,53 @@ Important environment settings:
 One fresh `codex exec` session has meaningful fixed context overhead. Keep
 batching enabled; do not revert to one invocation per paper unless quota use is
 acceptable.
+
+### Optional Spark Qwen3 narration
+
+With a provisioned, versioned narration bundle, set `SPARK_TTS_HOST` to its SSH
+alias, `SPARK_TTS_ROOT` to the remote bundle directory, and `SPARK_TTS_PYTHON`
+to the Qwen3 environment's Python. Voice references, transcripts, and the
+`voices.json` catalog stay outside Git. Inspect or use the installed profiles:
+
+```bash
+python3 spark_tts.py --list-voices
+python3 spark_tts.py --preflight --voice zv
+python3 spark_tts.py narration.md --voice zv
+# Choose another configured node and voice for a single narration:
+python3 spark_tts.py narration.md --host tts-node --voice ps
+# Explicitly split a longer narration between two nodes:
+python3 spark_tts.py narration.md --hosts tts-node-a tts-node-b --voice ps
+```
+
+`--hosts` is an opt-in command for standalone narrations. The daily digest still
+uses its existing single-node/local workflow. The coordinator cleans the text
+with the canonical pipeline, splits near the word midpoint at a paragraph or
+sentence boundary, and runs both parts concurrently with the same voice and
+model revision. It joins their MP3s in source order without re-encoding, checks
+the combined duration and decodes the whole result. Both parts' text/ASR reports
+remain available, with their offsets recorded in `parallel_manifest.json`. Any
+review flag marks the combined file `REVIEW_NEEDED`; a failed part prevents
+publication of a combined recording. Logs and completed parts are retained.
+
+The standalone command returns the local audio path and screening status. It
+keeps the spoken text, text screen, ASR report, transcript, hashes, and runtime
+manifest beside the audio. Reference-only entries without confirmed transcripts
+are preserved but cannot be selected for synthesis.
+
+To select this route for future daily digests, set `TTS_BACKEND=spark_qwen3`
+and `SPARK_TTS_VOICE` in `.env`, then reload the daemon after its current cycle.
+`TTS_BACKEND=local_coqui` remains the default. There is no automatic voice or
+engine substitution on failure. The remote worker runs one narration per node,
+checks at least 16 GiB of available memory, and uses the canonical pipeline's
+text screening, chunk-duration guard, and ASR comparison. Review flags are
+retained in the delivered filename and metadata. `asr_clean` describes this
+route's screening scope; the older Coqui route retains `structural_clean`.
+
+The remote bundle contains `spark_tts_worker.py`, the canonical
+`media_to_tts.py` and `verify_tts_audio.py`, an offline snapshot launcher,
+`voices.json`, and `bundle.json` with the pinned model revision and file hashes.
+Each narration copies the pipeline into a unique run directory. Its model and
+Whisper caches must already be available locally on the node.
 
 ## Usage
 

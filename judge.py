@@ -7,7 +7,7 @@ import json
 import logging
 from pathlib import Path
 
-from codex_backend import CodexExecError, run_codex
+from codex_backend import CodexExecError, run_codex, backend_identity
 from config import (
     CODEX_JUDGE_BATCH_SIZE,
     CODEX_JUDGE_BATCH_WAIT_SECONDS,
@@ -145,7 +145,7 @@ async def _call_codex_judge(items: list[ContentItem]) -> list[dict] | None:
         )
         return _validate_batch_result(json.loads(output), len(items))
     except (CodexExecError, json.JSONDecodeError, ValueError) as exc:
-        log.warning("Codex judge batch failed: %s", exc)
+        log.warning("Judge model batch failed: %s", exc)
         return None
 
 
@@ -171,6 +171,7 @@ async def _next_batch(queue: ContentQueue, stop_event: asyncio.Event) -> list[Co
 
 
 def _apply_result(item: ContentItem, result: dict) -> None:
+    item.metadata["judge_model"] = backend_identity()
     item.technical_depth = result["technical_depth"]
     item.novelty = result["novelty"]
     item.relevance = result["relevance"]
@@ -189,7 +190,7 @@ def _apply_result(item: ContentItem, result: dict) -> None:
 
 async def judge_loop(queue: ContentQueue, stop_event: asyncio.Event):
     """Judge queued content in cost-efficient Codex batches until drained."""
-    log.info("Codex judge started — waiting for content")
+    log.info("Judge started — backend=%s; waiting for content", backend_identity())
 
     while not (stop_event.is_set() and queue.pending_count() == 0):
         batch = await _next_batch(queue, stop_event)
@@ -224,4 +225,4 @@ async def judge_loop(queue: ContentQueue, stop_event: asyncio.Event):
             for _ in batch:
                 queue.task_done()
 
-    log.info("Codex judge stopped")
+    log.info("Judge stopped")

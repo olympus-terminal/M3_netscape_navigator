@@ -1,4 +1,4 @@
-"""Safe asynchronous adapter for non-interactive Codex transformation agents."""
+"""Transformation routing for a local API or the isolated Codex CLI backend."""
 
 from __future__ import annotations
 
@@ -12,7 +12,10 @@ import tempfile
 from contextlib import suppress
 from pathlib import Path
 
-from config import CODEX_BIN, CODEX_IGNORE_USER_CONFIG, CODEX_MODEL
+from config import (
+    CODEX_BIN, CODEX_IGNORE_USER_CONFIG, CODEX_MODEL,
+    LLM_BACKEND, LLM_MODEL, LLM_DEPLOYMENT,
+)
 
 log = logging.getLogger(__name__)
 
@@ -125,6 +128,15 @@ async def run_codex(
     ``payload`` may contain untrusted scraped content and is sent through stdin,
     which Codex presents as a separate input block.
     """
+    if LLM_BACKEND == "openai_compatible":
+        from compatible_backend import ModelError, transform
+        try:
+            return await transform(
+                instruction, payload, timeout_seconds=timeout_seconds,
+                output_schema=output_schema,
+            )
+        except ModelError as exc:
+            raise CodexExecError(str(exc)) from exc
     if not instruction.strip():
         raise ValueError("Codex instruction must not be empty")
     if timeout_seconds <= 0:
@@ -219,7 +231,14 @@ async def run_codex(
 
 
 async def preflight_codex(timeout_seconds: int = 15) -> tuple[str, str]:
-    """Verify the configured CLI exists and has reusable saved authentication."""
+    """Check the configured model endpoint or CLI and saved authentication."""
+
+    if LLM_BACKEND == "openai_compatible":
+        from compatible_backend import ModelError, preflight
+        try:
+            return await preflight(timeout_seconds)
+        except ModelError as exc:
+            raise CodexExecError(str(exc)) from exc
 
     async def run_check(*args: str) -> str:
         try:
@@ -250,3 +269,12 @@ async def preflight_codex(timeout_seconds: int = 15) -> tuple[str, str]:
     auth = await run_check("login", "status")
     log.info("Codex preflight passed: %s", version)
     return version, auth
+
+
+def backend_identity() -> dict:
+    """Configured identity; local calls also verify the response model name."""
+    return {
+        "backend": LLM_BACKEND,
+        "model": LLM_MODEL if LLM_BACKEND == "openai_compatible" else CODEX_MODEL or "cli_default",
+        "deployment": LLM_DEPLOYMENT or None,
+    }

@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
-from codex_backend import CodexExecError, run_codex
+from codex_backend import CodexExecError, run_codex, backend_identity
 from config import (
     AUDIO_DIR,
     CODEX_MAX_WRITER_ATTEMPTS,
@@ -27,6 +27,7 @@ from config import (
     SCRIPT_DIR_OUT,
     TARGET_WORD_COUNT,
     TTS_CONDA_PYTHON,
+    TTS_BACKEND,
     TTS_ENABLED,
     TTS_FORMAT,
     TTS_SCRIPT,
@@ -206,6 +207,11 @@ def _toolkit_provenance(script_path: Path) -> tuple[str | None, bool | None]:
 def preflight_tts() -> dict:
     """Verify the configured screened Coqui runtime without synthesizing audio."""
     global _TTS_PREFLIGHT_CACHE
+    if TTS_BACKEND == "spark_qwen3":
+        from spark_tts import inspect
+        runtime = {"enabled": True, **inspect()}
+        _TTS_PREFLIGHT_CACHE = runtime
+        return dict(runtime)
     if _TTS_PREFLIGHT_CACHE is not None:
         return dict(_TTS_PREFLIGHT_CACHE)
     if not TTS_ENABLED:
@@ -373,7 +379,7 @@ async def _call_codex_scriptwriter(
             return segment.strip()
         except (CodexExecError, json.JSONDecodeError, ValueError) as exc:
             log.warning(
-                "Codex writer attempt %s/%s failed: %s",
+                "Writer attempt %s/%s failed: %s",
                 attempt,
                 CODEX_MAX_WRITER_ATTEMPTS,
                 exc,
@@ -386,6 +392,7 @@ async def _call_codex_scriptwriter(
 def _writer_instruction(batch_num: int, total_batches: int, target_words: int) -> str:
     task = (
         f"Write segment {batch_num} of {total_batches} for today's AI research briefing.\n"
+        f"Today's local date is {datetime.now().astimezone().date().isoformat()}.\n"
         f"Target length: about {target_words} words."
     )
     if batch_num == 1:
@@ -626,6 +633,42 @@ async def compose_digest_script(items: list[ContentItem]) -> Path | None:
     return script_path
 
 
+def _synthesize_spark_audio(script_path, source_notes_path, delivery_time=None):
+    from spark_tts import narrate
+    try:
+        result, paths = narrate(script_path, AUDIO_DIR, audio_format=TTS_FORMAT)
+        status = "asr_clean" if result["status"] == "CLEAN" else "review_needed"
+        completed = datetime.now().astimezone()
+        manifest_path = Path(result["local_run"]) / "tts_manifest.json"
+        manifest = {
+            **result, "status": status, "timestamp": completed.isoformat(),
+            "format": TTS_FORMAT, "voice_requested": result["voice"],
+            "voice_resolved": result["voice_name"],
+            "screening_report": str(paths["screening_report"]),
+            "screening_report_sha256": _sha256_file(paths["screening_report"]),
+            "text_screen_sha256": _sha256_file(paths["text_screen"]),
+            "source_notes_sha256": _sha256_file(source_notes_path),
+        }
+        audio, notes, method, published = _publish_delivery_bundle(
+            paths["audio"], source_notes_path, status, delivery_time or completed,
+        )
+        manifest.update({"audio_path": str(audio), "source_notes_path": str(notes),
+                         "delivery_method": method, "published_at": published.isoformat()})
+        try:
+            _write_json_atomic(manifest_path, manifest)
+        except Exception:
+            audio.unlink(missing_ok=True)
+            notes.unlink(missing_ok=True)
+            raise
+        log.info("Qwen3 audio ready: %s, voice=%s, duration=%.1fs, QC=%s",
+                 audio, result["voice"], result["duration_seconds"], status)
+        return AudioSynthesisResult(audio, notes, manifest_path, paths["screening_report"],
+                                    status, result["status"] == "CLEAN")
+    except Exception:
+        log.exception("Spark Qwen3 synthesis failed; diagnostic files retained")
+        return None
+
+
 def synthesize_audio(
     script_path: Path,
     source_notes_path: Path,
@@ -637,6 +680,8 @@ def synthesize_audio(
     if not source_notes_path.is_file():
         log.error("Digest source notes are missing: %s", source_notes_path)
         return None
+    if TTS_BACKEND == "spark_qwen3":
+        return _synthesize_spark_audio(script_path, source_notes_path)
 
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -909,6 +954,7 @@ def save_digest_metadata(
 
     meta = {
         "timestamp": now.isoformat(),
+        "writer_model": backend_identity(),
         "item_count": len(items),
         "script_path": str(script_path),
         "source_notes_path": str(published_notes_path.resolve()),
