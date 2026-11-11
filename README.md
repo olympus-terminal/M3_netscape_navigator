@@ -1,4 +1,5 @@
 # AI Research Audio Agent
+@@ this program has been using Xiaomi's MiMo V2.6 lately completely locally; works well
 
 Autonomous agent that crawls current AI research, filters it through isolated
 `codex exec` workers or a local model API, writes a technical narration script, and optionally turns
